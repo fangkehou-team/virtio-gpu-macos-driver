@@ -18,9 +18,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
-#include <IOKit/IOMemoryDescriptor.h>
-#include <libkern/OSDebug.h>
-#include <mach/mach_time.h>
+#include <mach/mach_types.h>   /* kernel_task */
 
 extern "C" {
 kern_return_t _start(kmod_info_t *ki, void *data);
@@ -134,7 +132,7 @@ struct vq {
     uint16_t   freeHead, freeCount;
     uint16_t   lastUsed;
     uint16_t   availFlagsShadow;
-    IOMemoryDescriptor *descMem;   /* one allocation holds desc+avail+used, aligned */
+    IOBufferMemoryDescriptor *descMem;   /* one allocation holds desc+avail+used, aligned */
     void      *cookie[VQ_RING_SIZE];
 };
 
@@ -200,10 +198,9 @@ bool VirtIOGPU::start(IOService *provider)
     fPCI = OSDynamicCast(IOPCIDevice, provider);
     if (!fPCI) { LOG("no PCI provider"); return false; }
 
-    if (fPCI->requestProbe(kIOPCIConfiguratorBaseAddress)) {}
     fPCI->setIOEnable(true);
     fPCI->setMemoryEnable(true);
-    fPCI->configWrite16(kIOPCIConfigCommand, 0x7);  /* IO + MEM + BUSMASTER */
+    fPCI->setBusMasterEnable(true);   /* the device DMAs into the used ring */
 
     fBar0 = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
     if (!fBar0) { LOG("BAR0 map failed"); return false; }
