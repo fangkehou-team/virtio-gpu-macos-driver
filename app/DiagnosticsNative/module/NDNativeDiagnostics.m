@@ -78,11 +78,11 @@ NSDictionary *NDPrerequisites(pid_t target,uid_t owner,NSTimeInterval budget){
     if(dladdr((const void*)&NDPrerequisites,&ownImage)&&ownImage.dli_fname)helperHash=nd_hash_file(@(ownImage.dli_fname));
     [components addObject:@{@"component":@"local_diagnostics_helper",@"present":@(helperHash!=nil),@"SHA256":helperHash?:@"unavailable"}];
     NSDictionary *locations=@{
-        @"gpu_plugin":@"/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver",
-        @"translator_bundle_sibling":@"/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvmtl_translate.dylib",
-        @"translator_runtime_fallback":@"/Library/GPUBundles/nvmtl/libnvmtl_translate.dylib",
-        @"vulkan_loader":@"/Library/GPUBundles/nvmtl/libvulkan.dylib",
-        @"vulkan_backend":@"/Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib",
+        @"gpu_plugin":@"/Library/GPUBundles/VMTLDriver.bundle/Contents/MacOS/VMTLDriver",
+        @"translator_bundle_sibling":@"/Library/GPUBundles/VMTLDriver.bundle/Contents/MacOS/libvmtl_translate.dylib",
+        @"translator_runtime_fallback":@"/Library/GPUBundles/vmtl/libvmtl_translate.dylib",
+        @"vulkan_loader":@"/Library/GPUBundles/vmtl/libvulkan.dylib",
+        @"vulkan_backend":@"/Library/GPUBundles/vmtl/libvulkan_nouveau.dylib",
         @"NVRM":@"/Library/Extensions/NVRM.kext/Contents/MacOS/NVRM",
         @"NVAccel":@"/Library/Extensions/NVAccel.kext/Contents/MacOS/NVAccel",
         @"NVRMFB":@"/Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB",

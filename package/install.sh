@@ -37,7 +37,7 @@ rollback_install() {
     rm -rf "$EXT/$k.kext" || failed=1
     [ ! -e "$BK/$k.kext" ] || ditto "$BK/$k.kext" "$EXT/$k.kext" || failed=1
   done
-  for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do
+  for b in VMTLDriver.bundle NVIDIAShared.bundle vmtl vmtl-allow.txt; do
     rm -rf "$GB/$b" || failed=1
     [ ! -e "$BK/$b" ] || ditto "$BK/$b" "$GB/$b" || failed=1
   done
@@ -167,10 +167,10 @@ ok "test collection holds all four kexts"
 BK=$(mktemp -d "/Library/NullMoth/backup-$(date +%Y%m%d-%H%M%S).XXXXXX") && [ -n "$BK" ] && [ -d "$BK" ] || die "create unique backup directory"
 step "4. back up what is there now -> $BK"
 printf '%s\n' "$BUILD" > "$BK/macos-build" || die "record backup macOS build"
-# ditto, not cp -Rp: cp re-applies file flags through symlinks and stopped on nvmtl/libvulkan.dylib with "chflags: Too
+# ditto, not cp -Rp: cp re-applies file flags through symlinks and stopped on vmtl/libvulkan.dylib with "chflags: Too
 # many levels of symbolic links" (Mac 1.10 logs 10-10, 2 uploads); ditto keeps links, flags and xattrs, as the restore does.
 for k in $KEXTS; do [ ! -e "$EXT/$k.kext" ] || backup_copy "$k" ditto "$EXT/$k.kext" "$BK/$k.kext"; done
-for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do [ ! -e "$GB/$b" ] || backup_copy "$b" ditto "$GB/$b" "$BK/$b"; done
+for b in VMTLDriver.bundle NVIDIAShared.bundle vmtl vmtl-allow.txt; do [ ! -e "$GB/$b" ] || backup_copy "$b" ditto "$GB/$b" "$BK/$b"; done
 [ ! -f "$KC" ] || backup_copy "kernel collection" cp -p "$KC" "$BK/AuxiliaryKernelExtensions.kc"
 [ ! -d /Library/NullMoth/kexts ] || backup_copy "cached accelerators" ditto /Library/NullMoth/kexts "$BK/kexts"
 [ ! -f /Library/NullMoth/os-major ] || backup_copy "OS record" cp -p /Library/NullMoth/os-major "$BK/os-major"
@@ -190,16 +190,16 @@ done
 chown -R root:wheel /Library/NullMoth/kexts && chmod -R go-w /Library/NullMoth/kexts || die "cached accelerator permissions"
 echo "$MAJ" > /Library/NullMoth/os-major || die "record selected OS"
 mkdir -p "$GB" "$FW" || die "create bundle and firmware directories"
-for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "copy $b (restore from $BK)"; done
-cp "$HERE/Library/GPUBundles/nvmtl-allow.txt" "$GB/" || die "copy bundle allow list"
+for b in VMTLDriver.bundle NVIDIAShared.bundle vmtl; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "copy $b (restore from $BK)"; done
+cp "$HERE/Library/GPUBundles/vmtl-allow.txt" "$GB/" || die "copy bundle allow list"
 ditto "$HERE/Users/Shared/nvfw" "$FW" || die "copy firmware"
 for k in $KEXTS; do chown -R root:wheel "$EXT/$k.kext" && chmod -R 755 "$EXT/$k.kext" || die "permissions for $k"; done
-chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" "$GB/nvmtl-allow.txt" && chmod -R a+rX "$FW" || die "bundle or firmware permissions"
+chown -R root:wheel "$GB/VMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/vmtl" "$GB/vmtl-allow.txt" && chmod -R a+rX "$FW" || die "bundle or firmware permissions"
 # WindowServer runs as _windowserver and must read the bundles and the allow list. WAS: cp under the app's privileged
-# helper (umask 077) left nvmtl-allow.txt at 0600, WindowServer got no Metal device, and CoreDisplay aborted
+# helper (umask 077) left vmtl-allow.txt at 0600, WindowServer got no Metal device, and CoreDisplay aborted
 # ("Failed to create MetalDevice") on every start: the crash loop after install on many machines.
-chmod -R go-w,a+rX "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" && chmod 644 "$GB/nvmtl-allow.txt" || die "bundle permissions"
-sudo -u _windowserver /bin/test -r "$GB/nvmtl-allow.txt" || die "WindowServer cannot read $GB/nvmtl-allow.txt (restore from $BK)"
+chmod -R go-w,a+rX "$GB/VMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/vmtl" && chmod 644 "$GB/vmtl-allow.txt" || die "bundle permissions"
+sudo -u _windowserver /bin/test -r "$GB/vmtl-allow.txt" || die "WindowServer cannot read $GB/vmtl-allow.txt (restore from $BK)"
 NEWKC="$KC.nullmoth-install-new"; rm -f "$NEWKC"
 kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} -B $KB -S $KS --repository "$EXT" -A "$NEWKC" -z >"$T/kmutil2.log" 2>&1 || die "live kernel collection build failed (restore from $BK)"
 [ -s "$NEWKC" ] || die "live kernel collection build produced no output (restore from $BK)"

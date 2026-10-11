@@ -71,7 +71,7 @@ enum Profile {
             guard let id = r["id"] as? String, matches(r["match"] as? [String: Any] ?? [:], p) else { continue }
             ids.append(id)
             for (k, v) in (r["conf"] as? [String: String]) ?? [:]
-            where k.range(of: #"^(NVMTL|NVK|NVRM)_[A-Z0-9_]+$"#, options: .regularExpression) != nil
+            where k.range(of: #"^(VMTL|NVK|NVRM)_[A-Z0-9_]+$"#, options: .regularExpression) != nil
                && v.range(of: #"^[A-Za-z0-9._-]{0,64}$"#, options: .regularExpression) != nil { conf[k] = v }
         }
         return (ids, conf)

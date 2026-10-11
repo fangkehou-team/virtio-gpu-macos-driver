@@ -18,14 +18,14 @@ class Backup(m.Install):
   guard=self.root/'Library/NullMoth/install.lock';guard.mkdir();(guard/'foreign').write_bytes(b'guard-owner')
   r=self.run_install(CHECK='1');self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertEqual((guard/'foreign').read_bytes(),b'guard-owner');self.assertFalse(self.backup_paths());self.assert_creates(1)
  def test_backup_copy_failure_is_bounded_and_before_install(self):
-  wrapper=self.bin/'ditto';wrapper.write_text('#!/bin/bash\ncase "$1 $2" in *GPUBundles/nvmtl\ *NullMoth/backup-*) /usr/bin/printf "%20000s" "" >&2; echo "controlled copy error" >&2; exit 73;; esac\nexec /usr/bin/ditto "$@"\n');wrapper.chmod(0o755)
-  r=self.run_install();self.assert_restored(r);self.assertIn('command-status=73',r.stderr);self.assertIn('controlled copy error',r.stderr);self.assertLess(len(r.stderr.encode()),4400);self.assertIn('STOP: back up nvmtl',r.stderr);self.assert_creates(1);self.assertEqual(len(self.backup_paths()),1);self.assertFalse((self.root/'Library/NullMoth/install.lock').exists())
+  wrapper=self.bin/'ditto';wrapper.write_text('#!/bin/bash\ncase "$1 $2" in *GPUBundles/vmtl\ *NullMoth/backup-*) /usr/bin/printf "%20000s" "" >&2; echo "controlled copy error" >&2; exit 73;; esac\nexec /usr/bin/ditto "$@"\n');wrapper.chmod(0o755)
+  r=self.run_install();self.assert_restored(r);self.assertIn('command-status=73',r.stderr);self.assertIn('controlled copy error',r.stderr);self.assertLess(len(r.stderr.encode()),4400);self.assertIn('STOP: back up vmtl',r.stderr);self.assert_creates(1);self.assertEqual(len(self.backup_paths()),1);self.assertFalse((self.root/'Library/NullMoth/install.lock').exists())
  def test_same_second_runs_have_distinct_immutable_backup_sets(self):
-  old=self.root/'Library/GPUBundles/nvmtl/obsolete';old.write_bytes(b'old-only')
+  old=self.root/'Library/GPUBundles/vmtl/obsolete';old.write_bytes(b'old-only')
   first=self.run_install();self.assertEqual(first.returncode,0,first.stdout+first.stderr);one=self.backup_paths();self.assertEqual(len(one),1);first_snapshot={p.relative_to(one[0]).as_posix():p.read_bytes() for p in one[0].rglob('*') if p.is_file()}
   # The installed replacement no longer contains obsolete. A new recovery copy must not inherit it.
   self.assertFalse(old.exists());second=self.run_install();self.assertEqual(second.returncode,0,second.stdout+second.stderr);two=self.backup_paths();self.assertEqual(len(two),2)
-  other=next(p for p in two if p!=one[0]);self.assertFalse((other/'nvmtl/obsolete').exists());self.assertEqual(first_snapshot,{p.relative_to(one[0]).as_posix():p.read_bytes() for p in one[0].rglob('*') if p.is_file()})
+  other=next(p for p in two if p!=one[0]);self.assertFalse((other/'vmtl/obsolete').exists());self.assertEqual(first_snapshot,{p.relative_to(one[0]).as_posix():p.read_bytes() for p in one[0].rglob('*') if p.is_file()})
  def test_overlapping_install_is_refused_and_first_retains_guard(self):
   helper=self.bin/'kmutil';source=helper.read_text();prefix='''import time
 if os.environ.get('FAKE_HOLD') and name=='kmutil' and a[0]=='create' and not (r/'entered').exists():

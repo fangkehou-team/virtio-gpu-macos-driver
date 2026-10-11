@@ -555,7 +555,7 @@ public:
         bool r = IOGraphicsAccelerator2::start(provider);
         ALOG("IOGraphicsAccelerator2::start -> %d", r);
         if (r) {
-            registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "NVMTLDriver");
+            registerService(); ALOG("registerService() called — Metal can now find MetalPluginName=%s", "VMTLDriver");
             gAccel = this; gEnableAccel = &NVAccel::enableFromHook;
             for (unsigned i = 0; i < NV_CARRIERS; i++) {
                 IOAccelNVRMCarrier *c = OSTypeAlloc(IOAccelNVRMCarrier);

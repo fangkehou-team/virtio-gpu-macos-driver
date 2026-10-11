@@ -5,18 +5,18 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 static CAPS: AtomicU32 = AtomicU32::new(0);
 #[no_mangle]
-pub extern "C" fn nvmtl_translate_set_caps(caps: u32) { CAPS.store(caps, Ordering::Relaxed); }
+pub extern "C" fn vmtl_translate_set_caps(caps: u32) { CAPS.store(caps, Ordering::Relaxed); }
 
-const NVMTL_TG_MAX: usize = 32;
+const VMTL_TG_MAX: usize = 32;
 thread_local! {
-    static TG_LEN: std::cell::RefCell<[u32; NVMTL_TG_MAX]> = const {
-        std::cell::RefCell::new([0; NVMTL_TG_MAX])
+    static TG_LEN: std::cell::RefCell<[u32; VMTL_TG_MAX]> = const {
+        std::cell::RefCell::new([0; VMTL_TG_MAX])
     };
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_translate_set_threadgroup_lengths(lens: *const u32, count: u32) {
-    let n = if lens.is_null() { 0 } else { (count as usize).min(NVMTL_TG_MAX) };
+pub extern "C" fn vmtl_translate_set_threadgroup_lengths(lens: *const u32, count: u32) {
+    let n = if lens.is_null() { 0 } else { (count as usize).min(VMTL_TG_MAX) };
     TG_LEN.with(|storage| {
         let mut lengths = storage.borrow_mut();
         lengths.fill(0);
@@ -38,7 +38,7 @@ fn apply_tg(mut o: metal2vulkan::passes::TransformOptions) -> metal2vulkan::pass
     for (index, length) in threadgroup_lengths() {
         match o.with_threadgroup_memory_length(index, length) {
             Ok(next) => o = next,
-            Err(e) => { eprintln!("nvmtl_translate: threadgroup index {index} length {length} refused: {e}"); break; }
+            Err(e) => { eprintln!("vmtl_translate: threadgroup index {index} length {length} refused: {e}"); break; }
         }
     }
     o
@@ -65,14 +65,14 @@ fn translate_one(ll: &str, st: Stage) -> Result<Vec<u8>, String> {
     if let Some(o) = if caps != 0 { formatless_options(ll, st, caps) } else { None } {
         match metal2vulkan::translate_native_no_retry_constructed_with_options(ll, st, apply_tg(o)) {
             Ok(v) => return Ok(v),
-            Err(e) => eprintln!("nvmtl_translate: formatless storage images refused, falling back: {e}"),
+            Err(e) => eprintln!("vmtl_translate: formatless storage images refused, falling back: {e}"),
         }
     }
     metal2vulkan::translate_native_no_retry_constructed_with_options(ll, st, apply_tg(metal2vulkan::passes::TransformOptions::default()))
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_translate(
+pub extern "C" fn vmtl_translate(
     ll: *const c_char, stage: *const c_char, out: *mut *mut u8, out_len: *mut usize,
     err: *mut c_char, err_len: usize,
 ) -> i32 {
@@ -102,25 +102,25 @@ pub extern "C" fn nvmtl_translate(
 }
 
 // A kernel that fails inside an app (Geekbench's OpenCL convolve) cannot be reproduced offline without its AIR.
-// NVMTL_DUMP_FAILED_DIR=<dir> writes the input and the error beside it; unset, this costs one env read on failure only.
+// VMTL_DUMP_FAILED_DIR=<dir> writes the input and the error beside it; unset, this costs one env read on failure only.
 fn dump_failed(ll: &str, st: Stage, e: &str) {
-    let Some(dir) = std::env::var_os("NVMTL_DUMP_FAILED_DIR") else { return };
+    let Some(dir) = std::env::var_os("VMTL_DUMP_FAILED_DIR") else { return };
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     ll.hash(&mut h);
     let base = std::path::Path::new(&dir).join(format!("{:016x}-{:?}", h.finish(), st));
     if let Err(w) = std::fs::write(base.with_extension("ll"), ll).and_then(|_| std::fs::write(base.with_extension("err"), e)) {
-        eprintln!("nvmtl_translate: NVMTL_DUMP_FAILED_DIR write failed: {w}");
+        eprintln!("vmtl_translate: VMTL_DUMP_FAILED_DIR write failed: {w}");
     }
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_translate_free(p: *mut u8, len: usize) {
+pub extern "C" fn vmtl_translate_free(p: *mut u8, len: usize) {
     if !p.is_null() { unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(p, len))); } }
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_visible_refs(
+pub extern "C" fn vmtl_visible_refs(
     ll: *const c_char, out: *mut *mut u8, out_len: *mut usize, err: *mut c_char, err_len: usize,
 ) -> i32 {
     let set_err = |msg: &str| unsafe {
@@ -144,7 +144,7 @@ pub extern "C" fn nvmtl_visible_refs(
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_link_visible(
+pub extern "C" fn vmtl_link_visible(
     ll: *const c_char, stage: *const c_char,
     syms: *const *const c_char, mods: *const *const c_char, n: usize,
     out: *mut *mut u8, out_len: *mut usize, err: *mut c_char, err_len: usize,
@@ -183,7 +183,7 @@ pub extern "C" fn nvmtl_link_visible(
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_link_externs(
+pub extern "C" fn vmtl_link_externs(
     ll: *const c_char, mods: *const *const c_char, n: usize,
     out: *mut *mut u8, out_len: *mut usize, err: *mut c_char, err_len: usize,
 ) -> i32 {
@@ -214,7 +214,7 @@ pub extern "C" fn nvmtl_link_externs(
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_lower_mesh(
+pub extern "C" fn vmtl_lower_mesh(
     ll: *const c_char, entry: *const c_char,
     out_k: *mut *mut u8, out_k_len: *mut usize, out_v: *mut *mut u8, out_v_len: *mut usize,
     layout: *mut u32, err: *mut c_char, err_len: usize,
@@ -245,7 +245,7 @@ pub extern "C" fn nvmtl_lower_mesh(
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_lower_mesh2(
+pub extern "C" fn vmtl_lower_mesh2(
     obj_ll: *const c_char, obj_entry: *const c_char, ll: *const c_char, entry: *const c_char,
     mode: u32, cap: u32,
     out_o: *mut *mut u8, out_o_len: *mut usize,
@@ -308,7 +308,7 @@ pub extern "C" fn nvmtl_lower_mesh2(
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_link_runtime(
+pub extern "C" fn vmtl_link_runtime(
     ll: *const c_char, stage: *const c_char,
     refs: *const *const c_char, ref_mods: *const *const c_char, nref: usize,
     cands: *const *const c_char, cand_mods: *const *const c_char, ncand: usize,
@@ -358,7 +358,7 @@ pub extern "C" fn nvmtl_link_runtime(
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_translate_fc(
+pub extern "C" fn vmtl_translate_fc(
     ll: *const c_char, stage: *const c_char,
     indices: *const u32, sizes: *const u32, payloads: *const *const u8, n: usize,
     out: *mut *mut u8, out_len: *mut usize,
@@ -403,7 +403,7 @@ pub extern "C" fn nvmtl_translate_fc(
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_reflect(
+pub extern "C" fn vmtl_reflect(
     ll: *const c_char, stage: *const c_char,
     out: *mut *mut u8, out_len: *mut usize,
     err: *mut c_char, err_len: usize,
@@ -434,7 +434,7 @@ pub extern "C" fn nvmtl_reflect(
 }
 
 #[no_mangle]
-pub extern "C" fn nvmtl_reflect_fc(
+pub extern "C" fn vmtl_reflect_fc(
     ll: *const c_char, stage: *const c_char,
     indices: *const u32, sizes: *const u32, payloads: *const *const u8, n: usize,
     out: *mut *mut u8, out_len: *mut usize,
@@ -493,7 +493,7 @@ mod storage_caps_tests {
         use std::collections::BTreeMap;
         let check=|b:&[u8]|->Result<(),String>{ let w:Vec<u32>=b.chunks_exact(4).map(|w|u32::from_le_bytes(w.try_into().unwrap())).collect();
             spirv_tools::val::create(Some(spirv_tools::TargetEnv::Vulkan_1_2)).validate(&w,None).map_err(|e|e.to_string()) };
-        let mut files:Vec<_>=std::fs::read_dir("/Library/GPUBundles/nvmtl/aircache").unwrap().filter_map(|e|e.ok()).map(|e|e.path()).collect(); files.sort();
+        let mut files:Vec<_>=std::fs::read_dir("/Library/GPUBundles/vmtl/aircache").unwrap().filter_map(|e|e.ok()).map(|e|e.path()).collect(); files.sort();
         let t0=std::time::Instant::now();
         let mut nostex=0; let (mut units,mut same,mut differ_ok,mut differ_bad,mut differ_wasbad,mut refused,mut rescued,mut both_err)=(0,0,0,0,0,0,0,0);
         let mut why:BTreeMap<String,(u32,String)>=BTreeMap::new();
@@ -524,7 +524,7 @@ mod storage_caps_tests {
     }
 }
 #[no_mangle]
-pub unsafe extern "C" fn nvmtl_lower_buffer_addresses(
+pub unsafe extern "C" fn vmtl_lower_buffer_addresses(
     data: *const u8, len: usize, out: *mut *mut u8, out_len: *mut usize,
     err: *mut c_char, err_len: usize,
 ) -> i32 {
@@ -535,7 +535,7 @@ pub unsafe extern "C" fn nvmtl_lower_buffer_addresses(
     }
 }
 #[no_mangle]
-pub unsafe extern "C" fn nvmtl_lower_buffer_addresses_ex(
+pub unsafe extern "C" fn vmtl_lower_buffer_addresses_ex(
     data: *const u8, len: usize, flags: u32, out: *mut *mut u8, out_len: *mut usize, info: *mut u32,
     err: *mut c_char, err_len: usize,
 ) -> i32 {
@@ -552,7 +552,7 @@ pub unsafe extern "C" fn nvmtl_lower_buffer_addresses_ex(
     }
 }
 #[no_mangle]
-pub unsafe extern "C" fn nvmtl_lower_buffer_addresses_g2(
+pub unsafe extern "C" fn vmtl_lower_buffer_addresses_g2(
     data: *const u8, len: usize, flags: u32, mask: u32, out: *mut *mut u8, out_len: *mut usize, info: *mut u32,
     err: *mut c_char, err_len: usize,
 ) -> i32 {
@@ -571,7 +571,7 @@ pub unsafe extern "C" fn nvmtl_lower_buffer_addresses_g2(
     }
 }
 #[no_mangle]
-pub unsafe extern "C" fn nvmtl_translate_samplers(
+pub unsafe extern "C" fn vmtl_translate_samplers(
     ll:*const c_char, stage:*const c_char, json:*const c_char,
     out:*mut *mut u8, out_len:*mut usize, err:*mut c_char, err_len:usize,
 )->i32 {
@@ -607,18 +607,18 @@ mod pixel_sampler_checks {
  use spirv_tools::val::Validator;
  #[test]
  fn compositor_pixel_sampler_spirv_validates() {
-  let ll=std::fs::read_to_string("$HOME/nvmtl-tests/k7-diagnostic/GPUPass.ll").unwrap();
+  let ll=std::fs::read_to_string("$HOME/vmtl-tests/k7-diagnostic/GPUPass.ll").unwrap();
   let ll=std::ffi::CString::new(ll).unwrap();let stage=std::ffi::CString::new("fragment").unwrap();
   for filter in ["Nearest","Linear"] { for gamma in [0u8,4] {
    let state=serde_json::json!({"min_filter":filter,"mag_filter":filter,"mip_filter":"None","address_mode_s":"ClampToEdge","address_mode_t":"ClampToEdge","address_mode_r":"ClampToEdge","coordinates":"Pixel","compare_function":"None","max_anisotropy":1,"lod_min_clamp":0.0,"lod_max_clamp":1000.0,"border_color":"TransparentBlack","reduction":"WeightedAverage","lod_bias":0.0});
    let j=serde_json::json!({"samplers":{"0":state,"14":state},"constants":{"0":[gamma,0,0,0],"1":[0,0,0,0]}});
    let j=std::ffi::CString::new(j.to_string()).unwrap();let(mut out,mut len)=(std::ptr::null_mut(),0);let mut err=[0i8;2048];
-   let rc=unsafe {nvmtl_translate_samplers(ll.as_ptr(),stage.as_ptr(),j.as_ptr(),&mut out,&mut len,err.as_mut_ptr(),err.len())};
+   let rc=unsafe {vmtl_translate_samplers(ll.as_ptr(),stage.as_ptr(),j.as_ptr(),&mut out,&mut len,err.as_mut_ptr(),err.len())};
    assert_eq!(rc,0,"{}",unsafe{CStr::from_ptr(err.as_ptr())}.to_string_lossy());
    let bytes=unsafe{std::slice::from_raw_parts(out,len)};
    let words:Vec<u32>=bytes.chunks_exact(4).map(|c|u32::from_le_bytes(c.try_into().unwrap())).collect();
    spirv_tools::val::create(Some(spirv_tools::TargetEnv::Vulkan_1_2)).validate(&words,None).unwrap();
-   nvmtl_translate_free(out,len);
+   vmtl_translate_free(out,len);
    println!("PASS compositor {filter} gamma={gamma}: Vulkan 1.2 SPIR-V valid; unused bound sampler filtered");
   }}
  }
@@ -628,7 +628,7 @@ mod ca_named_checks {
  use spirv_tools::val::Validator;
  #[test] fn ca_named_modules_validate() {
   for name in ["fixed_vert_lpf_spc","fixed_frag_lpf_cpf"] {
-   let b=std::fs::read(format!("$HOME/nvmtl-tests/k7-diagnostic/named-{name}.spv")).unwrap();
+   let b=std::fs::read(format!("$HOME/vmtl-tests/k7-diagnostic/named-{name}.spv")).unwrap();
    let w:Vec<u32>=b.chunks_exact(4).map(|c|u32::from_le_bytes(c.try_into().unwrap())).collect();
    spirv_tools::val::create(Some(spirv_tools::TargetEnv::Vulkan_1_2)).validate(&w,None).unwrap();
    println!("PASS CoreAnimation {name}: named scalar/vector specialization validates");
@@ -643,17 +643,17 @@ mod threadgroup_configuration_tests {
 
     #[test]
     fn simultaneous_translations_keep_independent_lengths() {
-        nvmtl_translate_set_threadgroup_lengths(std::ptr::null(), 0);
+        vmtl_translate_set_threadgroup_lengths(std::ptr::null(), 0);
         let rendezvous = Arc::new(Barrier::new(3));
         let handles = [64u32, 8720].map(|bytes| {
             let rendezvous = Arc::clone(&rendezvous);
             std::thread::spawn(move || {
-                nvmtl_translate_set_threadgroup_lengths(&bytes, 1);
+                vmtl_translate_set_threadgroup_lengths(&bytes, 1);
                 rendezvous.wait();
                 let actual = threadgroup_lengths();
                 rendezvous.wait();
                 assert_eq!(actual, vec![(0, bytes)]);
-                nvmtl_translate_set_threadgroup_lengths(std::ptr::null(), 0);
+                vmtl_translate_set_threadgroup_lengths(std::ptr::null(), 0);
                 assert!(threadgroup_lengths().is_empty());
             })
         });

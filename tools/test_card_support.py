@@ -38,9 +38,9 @@ VENDOR = r'''
 #include <stdint.h>
 #include <string.h>
 static const char *deviceName;
-const char *nvmtl_vk_device_name(void){return deviceName;}
+const char *vmtl_vk_device_name(void){return deviceName;}
 void nvlog(const char *fmt,...){ }
-struct nvmtl_hwinfo {
+struct vmtl_hwinfo {
     uint32_t magic;
     uint32_t version;
     uint32_t arch_family;
@@ -49,24 +49,24 @@ struct nvmtl_hwinfo {
     uint32_t flags, reserved0;
     uint64_t reserved[4];
 };
-#define NVMTL_HWINFO_MAGIC   0x5748564Eu
-#define NVMTL_FAMILY_NVIDIA  0x01000016u
+#define VMTL_HWINFO_MAGIC   0x5748564Eu
+#define VMTL_FAMILY_NVIDIA  0x01000016u
 
 PRODUCTION
-int main(int argc,char **argv){deviceName=argc>1?argv[1]:NULL; const struct nvmtl_hwinfo *h=nvmtl_vendor_hwinfo();printf("%u %u %d\n",h->sm_major,h->sm_minor,nvmtl_vendor_chip_supported());}
+int main(int argc,char **argv){deviceName=argc>1?argv[1]:NULL; const struct vmtl_hwinfo *h=vmtl_vendor_hwinfo();printf("%u %u %d\n",h->sm_major,h->sm_minor,vmtl_vendor_chip_supported());}
 '''
 LOG = r'''
-#include "nvmtl_log_failure.h"
+#include "vmtl_log_failure.h"
 #include <assert.h>
 #include <stdio.h>
 int main(void){
  const char *errors[]={"vk: vkCreateDevice -> -8","vk: missing vkCreateBuffer","vendor: cannot load plugin","unsupported memory type","sampler refused","GPU fault","FAILED pipeline","REFUSED allocation"};
- for(unsigned i=0;i<sizeof(errors)/sizeof(errors[0]);i++)assert(nvmtl_log_failure(errors[i]));
- assert(!nvmtl_log_failure("device RTX 3060, buffers live 8"));
- assert(!nvmtl_log_failure("vk: initialized successfully"));
- assert(!nvmtl_log_failure("library default.metallib loaded"));
- assert(!nvmtl_log_failure("library DEFAULT.metallib loaded"));
- assert(nvmtl_log_failure("GPU_FAULT"));assert(!nvmtl_log_failure(0));
+ for(unsigned i=0;i<sizeof(errors)/sizeof(errors[0]);i++)assert(vmtl_log_failure(errors[i]));
+ assert(!vmtl_log_failure("device RTX 3060, buffers live 8"));
+ assert(!vmtl_log_failure("vk: initialized successfully"));
+ assert(!vmtl_log_failure("library default.metallib loaded"));
+ assert(!vmtl_log_failure("library DEFAULT.metallib loaded"));
+ assert(vmtl_log_failure("GPU_FAULT"));assert(!vmtl_log_failure(0));
  puts("PASS 8 release failure messages retained, normal chatter and null excluded");}
 '''
 UPLOAD = r'''
@@ -123,7 +123,7 @@ with tempfile.TemporaryDirectory(prefix="nullmoth-card-tests-") as directory:
     (tmp / "timing.cpp").write_text(TIMING.replace("PRODUCTION", timing))
     run("xcrun", "clang++", "-std=c++11", str(tmp / "timing.cpp"), "-o", str(tmp / "timing"))
     print(run(str(tmp / "timing")))
-    vendor = snippet("plugin/NVMTLVendorCompiler.m", "static const struct nvmtl_hwinfo *nvmtl_vendor_hwinfo(void) {", "static dispatch_data_t nvmtl_vendor_target_data")
+    vendor = snippet("plugin/VMTLVendorCompiler.m", "static const struct vmtl_hwinfo *vmtl_vendor_hwinfo(void) {", "static dispatch_data_t vmtl_vendor_target_data")
     (tmp / "vendor.m").write_text(VENDOR.replace("PRODUCTION", vendor))
     run("xcrun", "clang", "-fblocks", str(tmp / "vendor.m"), "-framework", "Foundation", "-o", str(tmp / "vendor"))
     cases = {"TU106": "7 5 1", "GA100": "8 0 1", "GA10B": "8 7 1", "GA106": "8 6 1", "AD107": "8 9 1", "GH100": "9 0 1", "GB100": "10 0 1", "GB206": "12 0 1", "UNKNOWN": "0 0 0", "XX999": "0 0 0"}
@@ -131,11 +131,11 @@ with tempfile.TemporaryDirectory(prefix="nullmoth-card-tests-") as directory:
         assert run(str(tmp / "vendor"), "NVIDIA (NVK " + chip + ")") == expected, chip
     assert run(str(tmp / "vendor")) == "0 0 0"
     print("PASS known SM targets and unknown-chip refusal")
-    assert "return on == 1 && nvmtl_vendor_chip_supported();" in (ROOT / "plugin/NVMTLVendorCompiler.m").read_text()
+    assert "return on == 1 && vmtl_vendor_chip_supported();" in (ROOT / "plugin/VMTLVendorCompiler.m").read_text()
     (tmp / "log.c").write_text(LOG)
     run("xcrun", "clang", "-I" + str(ROOT / "plugin"), str(tmp / "log.c"), "-o", str(tmp / "log"))
     print(run(str(tmp / "log")))
-    submit = snippet("plugin/NVMTLObjects.m", "- (BOOL)commitAndWaitUntilSubmitted {", "- (void)commit { [self nvmtlSubmitWithEvents]; }")
+    submit = snippet("plugin/VMTLObjects.m", "- (BOOL)commitAndWaitUntilSubmitted {", "- (void)commit { [self vmtlSubmitWithEvents]; }")
     (tmp / "submit.m").write_text(SUBMIT.replace("PRODUCTION", submit))
     run("xcrun", "clang", "-fobjc-arc", str(tmp / "submit.m"), "-framework", "Foundation", "-o", str(tmp / "submit"))
     for program in ("WindowServer", "mediaanalysisd", ""):

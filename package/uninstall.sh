@@ -10,7 +10,7 @@ REMOVING=0; RB=""; NEWKC=""; REMOVE_KC=0; CANDIDATE=""
 rollback_removal() {
   local failed=0 k b
   for k in $KEXTS; do [ ! -e "$RB/$k.kext" ] || cp -Rp "$RB/$k.kext" "$EXT/" || failed=1; done
-  for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do [ ! -e "$RB/$b" ] || cp -Rp "$RB/$b" "$GB/" || failed=1; done
+  for b in VMTLDriver.bundle NVIDIAShared.bundle vmtl vmtl-allow.txt; do [ ! -e "$RB/$b" ] || cp -Rp "$RB/$b" "$GB/" || failed=1; done
   [ ! -e "$RB/kexts" ] || cp -Rp "$RB/kexts" /Library/NullMoth/ || failed=1
   [ ! -e "$RB/driver-version" ] || cp -p "$RB/driver-version" /Library/NullMoth/driver-version || failed=1
   [ ! -e "$RB/update-pending" ] || cp -p "$RB/update-pending" /Library/NullMoth/update-pending || failed=1
@@ -60,13 +60,13 @@ fi
 # Finish all collection checks before changing installed files.
 if [ -z "$RB" ]; then RB=$(mktemp -d /var/tmp/nullmoth-remove.XXXX) && [ -n "$RB" ] || die "cannot create the removal backup"; fi
 for k in $KEXTS; do [ ! -e "$EXT/$k.kext" ] || cp -Rp "$EXT/$k.kext" "$RB/" || die "cannot back up $k"; done
-for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do [ ! -e "$GB/$b" ] || cp -Rp "$GB/$b" "$RB/" || die "cannot back up $b"; done
+for b in VMTLDriver.bundle NVIDIAShared.bundle vmtl vmtl-allow.txt; do [ ! -e "$GB/$b" ] || cp -Rp "$GB/$b" "$RB/" || die "cannot back up $b"; done
 for f in /Library/NullMoth/kexts /Library/NullMoth/driver-version /Library/NullMoth/update-pending /Library/LaunchDaemons/com.nullmoth.osupdate.plist "$KC"; do
   [ ! -e "$f" ] || cp -Rp "$f" "$RB/" || die "cannot back up the removal state"
 done
 REMOVING=1
 for k in $KEXTS; do rm -rf "$EXT/$k.kext" || die "cannot remove $k"; done
-for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do rm -rf "$GB/$b" || die "cannot remove $b"; done
+for b in VMTLDriver.bundle NVIDIAShared.bundle vmtl vmtl-allow.txt; do rm -rf "$GB/$b" || die "cannot remove $b"; done
 rm -rf /Library/NullMoth/kexts /Library/NullMoth/driver-version /Library/NullMoth/update-pending /Library/LaunchDaemons/com.nullmoth.osupdate.plist || die "cannot remove the cached driver or update switcher"
 if [ "$REMOVE_KC" = 1 ]; then
   rm -f "$KC" "$KC.nullmoth-install-new" "$KC.nullmoth-update-new" "$KC.nullmoth-remove-new" || die "cannot remove the auxiliary collection"

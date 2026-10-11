@@ -1,6 +1,6 @@
 #!/bin/bash
 set -u
-D="$HOME/nvmtl-build/nm/agdc"; B="$HOME/nvmtl-build/nm/out/agdc"; rm -rf "$B"; mkdir -p "$B/NVRMAGDC.kext/Contents/MacOS"
+D="$HOME/vmtl-build/nm/agdc"; B="$HOME/vmtl-build/nm/out/agdc"; rm -rf "$B"; mkdir -p "$B/NVRMAGDC.kext/Contents/MacOS"
 SDK="$(xcrun --show-sdk-path)"; KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 xcrun clang++ -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$D" -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT \
   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2 \

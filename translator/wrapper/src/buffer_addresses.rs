@@ -21,7 +21,7 @@ fn scalar_align(ty: u32, defs: &HashMap<u32, Instruction>, depth: usize) -> Resu
 }
 
 fn keep_stated_align(scalar: u32, stated: Option<&Operand>) -> u32 {
-    if std::env::var_os("NVMTL_NO_AIR_ALIGN").is_some() { return scalar; }
+    if std::env::var_os("VMTL_NO_AIR_ALIGN").is_some() { return scalar; }
     match stated { Some(Operand::LiteralBit32(a)) if a.is_power_of_two() && *a <= 16 => scalar.max(*a), _ => scalar }
 }
 
@@ -139,7 +139,7 @@ fn lower_addresses(bytes: &[u8]) -> Result<Vec<u8>, String> {
         let at=f.blocks[0].instructions.iter().position(|i|i.class.opcode!=Op::Variable).unwrap_or(f.blocks[0].instructions.len());
         f.blocks[0].instructions.splice(at..at,prelude);
     }
-    if std::env::var_os("NVMTL_NO_WIDE_WORD_LOAD").is_none() { crate::wide_loads::fuse(&mut m, &mut next, uint, ulong, &wide_hints); }
+    if std::env::var_os("VMTL_NO_WIDE_WORD_LOAD").is_none() { crate::wide_loads::fuse(&mut m, &mut next, uint, ulong, &wide_hints); }
     m.header.as_mut().unwrap().bound=next;
     let result:Vec<u8>=m.assemble().iter().flat_map(|w|w.to_le_bytes()).collect();
     metal2vulkan::canonicalize_spirv_bytes(&result)
@@ -204,7 +204,7 @@ OpFunctionEnd
         use metal2vulkan::passes::Stage; use std::collections::BTreeMap;
         let check=|b:&[u8]|->Result<(),String>{ let w:Vec<u32>=b.chunks_exact(4).map(|w|u32::from_le_bytes(w.try_into().unwrap())).collect();
             spirv_tools::val::create(Some(spirv_tools::TargetEnv::Vulkan_1_2)).validate(&w,None).map_err(|e|e.to_string()) };
-        let mut files:Vec<_>=std::fs::read_dir("/Library/GPUBundles/nvmtl/aircache").unwrap().filter_map(|e|e.ok()).map(|e|e.path()).collect(); files.sort();
+        let mut files:Vec<_>=std::fs::read_dir("/Library/GPUBundles/vmtl/aircache").unwrap().filter_map(|e|e.ok()).map(|e|e.path()).collect(); files.sort();
         let t0=std::time::Instant::now();
         let (mut units,mut lowered,mut refused,mut passthrough,mut ok_ok,mut bad_bad,mut fixed,mut broke)=(0,0,0,0,0,0,0,0);
         let mut broke_why:BTreeMap<String,(u32,String)>=BTreeMap::new();

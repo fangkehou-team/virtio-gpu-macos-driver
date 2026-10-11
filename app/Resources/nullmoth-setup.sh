@@ -171,13 +171,13 @@ if [ -n "$COLLECT" ]; then
     echo; echo "== driver files"; ls -la /Library/Extensions/NV*.kext /Library/GPUBundles 2>/dev/null
     echo; echo "== installed component fingerprints"
     [ ! -f "$ST/driver-version" ] || { printf 'installed driver version: '; cat "$ST/driver-version"; }
-    for f in /Library/Extensions/NVRM.kext/Contents/MacOS/NVRM /Library/Extensions/NVAccel.kext/Contents/MacOS/NVAccel /Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB /Library/Extensions/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver /Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib; do
+    for f in /Library/Extensions/NVRM.kext/Contents/MacOS/NVRM /Library/Extensions/NVAccel.kext/Contents/MacOS/NVAccel /Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB /Library/Extensions/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC /Library/GPUBundles/VMTLDriver.bundle/Contents/MacOS/VMTLDriver /Library/GPUBundles/vmtl/libvulkan_nouveau.dylib; do
       [ ! -f "$f" ] || shasum -a 256 "$f"
     done
     echo; echo "== processor"; sysctl machdep.cpu.vendor machdep.cpu.brand_string machdep.cpu.family machdep.cpu.model machdep.cpu.stepping 2>&1
     echo; echo "== NVRM"; ioreg -r -n NVRM -d 1 -l 2>/dev/null | grep -E '"nvrm-'
     echo; echo "== system profile and per-system rules"; cat "$ST/system-profile.json" 2>/dev/null || echo "(none recorded)"
-    sed -n '/^# --- 1401 per-system rules ---$/,/^# --- end 1401 per-system rules ---$/p' /Library/GPUBundles/nvmtl/nvrm610.conf 2>/dev/null
+    sed -n '/^# --- 1401 per-system rules ---$/,/^# --- end 1401 per-system rules ---$/p' /Library/GPUBundles/vmtl/nvrm610.conf 2>/dev/null
     # 10-07: a second user's install failed and nothing sent named the card. The GPU model and PCI ID
     # are what decide which code path the driver takes (Turing/Ampere/Ada/Blackwell).
     echo; echo "== graphics"; system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset Model|Type:|Bus:|VRAM|Vendor|Device ID|Revision ID|Metal|Resolution|Display Type|Online"
@@ -214,9 +214,9 @@ if [ -n "$COLLECT" ]; then
     | tail -n 2000 > "$COLLECT/driver-update-log.txt"
   log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-update-log.txt"
   { echo; echo "== current update message ring"; dmesg 2>&1 | grep -iE 'apfs|MobileSoftwareUpdate|softwareupdated' | tail -n 1000; } >> "$COLLECT/driver-update-log.txt"
-  # Release builds report failures to syslog rather than nvmtl.log. Debug builds may use either
+  # Release builds report failures to syslog rather than vmtl.log. Debug builds may use either
   # the system temp directory or the console user's temp directory.
-  log show --last 3d --style compact --predicate 'process != "kernel" AND (eventMessage CONTAINS[c] "NVMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason")' 2>&1 \
+  log show --last 3d --style compact --predicate 'process != "kernel" AND (eventMessage CONTAINS[c] "VMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason")' 2>&1 \
     | tail -n 3000 > "$COLLECT/driver-plugin-log.txt"
   log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-plugin-log.txt"
   console_user=$(stat -f %Su /dev/console 2>/dev/null)
@@ -224,7 +224,7 @@ if [ -n "$COLLECT" ]; then
   if [ -n "$console_user" ] && [ "$console_user" != root ] && [ "$console_user" != loginwindow ]; then
     console_tmp=$(sudo -u "$console_user" getconf DARWIN_USER_TEMP_DIR 2>/dev/null)
   fi
-  for f in /private/tmp/nvmtl.log "${console_tmp:+${console_tmp%/}/nvmtl.log}"; do
+  for f in /private/tmp/vmtl.log "${console_tmp:+${console_tmp%/}/vmtl.log}"; do
     [ -f "$f" ] || continue
     { echo; echo "== plugin file log"; tail -c 262144 "$f"; } >> "$COLLECT/driver-plugin-log.txt"
   done
@@ -243,7 +243,7 @@ if [ -n "$COLLECT" ]; then
       # Separate budgets: on a busy GPU the kernel lines alone filled a shared 1500-line tail and pushed out the
       # plugin's and WindowServer's own reason (measured: 1482 of 1500 lines were kernel lines).
       echo "-- plugin and WindowServer errors"
-      log show --start "$from" --end "$to" --style compact --predicate '(process != "kernel" AND (eventMessage CONTAINS[c] "NVMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason" OR eventMessage CONTAINS[c] "MetalDevice")) OR (process == "WindowServer" AND (messageType == error OR messageType == fault))' 2>&1 \
+      log show --start "$from" --end "$to" --style compact --predicate '(process != "kernel" AND (eventMessage CONTAINS[c] "VMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason" OR eventMessage CONTAINS[c] "MetalDevice")) OR (process == "WindowServer" AND (messageType == error OR messageType == fault))' 2>&1 \
         | awk -v to="$to" '!/^20[0-9][0-9]-/ || substr($0, 1, 19) <= to' \
         | tail -n 700
       echo "log show exit: ${PIPESTATUS[0]}"
@@ -876,14 +876,14 @@ UNINSTALLER="$(dirname "$INSTALLER")/nullmoth-uninstall.sh"
 DBK=$(echo "$out" | sed -n 's/^Undo: sudo .\/uninstall.sh //p' | tail -1)
 printf '%s=%q\n' DRIVER_BACKUP "$DBK" >> "$STATE" || stop "could not record the driver backup"
 # per-system rules (nullmoth-rules.json, picked by the app from this machine's profile): their knobs go in a marked
-# block of the driver's knob file, which install.sh has just written fresh. Only NVMTL_/NVK_/NVRM_ keys with plain values.
-CONF=/Library/GPUBundles/nvmtl/nvrm610.conf
+# block of the driver's knob file, which install.sh has just written fresh. Only VMTL_/NVK_/NVRM_ keys with plain values.
+CONF=/Library/GPUBundles/vmtl/nvrm610.conf
 if [ -f "$CONF" ]; then
   sed -i '' '/^# --- 1401 per-system rules ---$/,/^# --- end 1401 per-system rules ---$/d' "$CONF"
   if [ ${#KNOBS[@]} -gt 0 ]; then
     { echo "# --- 1401 per-system rules ---"
       for kv in "${KNOBS[@]}"; do
-        if [[ "$kv" =~ ^(NVMTL|NVK|NVRM)_[A-Z0-9_]+=[A-Za-z0-9._-]{0,64}$ ]]; then echo "$kv"; note "per-system rule: $kv" >&2
+        if [[ "$kv" =~ ^(VMTL|NVK|NVRM)_[A-Z0-9_]+=[A-Za-z0-9._-]{0,64}$ ]]; then echo "$kv"; note "per-system rule: $kv" >&2
         else echo "NOTE refused per-system knob '$kv' (not a driver knob)" >&2; fi
       done
       echo "# --- end 1401 per-system rules ---"; } >> "$CONF"

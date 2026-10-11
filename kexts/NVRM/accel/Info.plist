@@ -34,8 +34,8 @@
 			<key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
 			<key>IOMatchCategory</key><string>IOAccelerator</string>
 			<key>IOProbeScore</key><integer>100</integer>
-			<key>MetalPluginName</key><string>../../../Library/GPUBundles/NVMTLDriver</string>
-			<key>MetalPluginClassName</key><string>NVMTLDevice</string>
+			<key>MetalPluginName</key><string>../../../Library/GPUBundles/VMTLDriver</string>
+			<key>MetalPluginClassName</key><string>VMTLDevice</string>
 		</dict>
 	</dict>
 </dict>

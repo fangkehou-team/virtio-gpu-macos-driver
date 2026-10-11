@@ -68,11 +68,11 @@ class Install(unittest.TestCase):
             (b.parent.parent/'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':'com.nullmoth.NVAccel','NMTargetOSMajor':major}))
         for k in KEXTS:
             b=self.payload/f'Library/Extensions/{k}.kext/Contents/MacOS/{k}';b.parent.mkdir(parents=True);b.write_bytes(('new-'+k).encode())
-        for b in ['NVMTLDriver.bundle','NVIDIAShared.bundle','nvmtl']:
+        for b in ['VMTLDriver.bundle','NVIDIAShared.bundle','vmtl']:
             p=self.payload/'Library/GPUBundles'/b;p.mkdir(parents=True);(p/'fixture').write_text('new-'+b)
-        (self.payload/'Library/GPUBundles/nvmtl-allow.txt').write_text('new-allow')
+        (self.payload/'Library/GPUBundles/vmtl-allow.txt').write_text('new-allow')
         load=struct.pack('<6I',0x32,24,1,0x000f0500,0x000f0500,0)
-        runtime=self.payload/'Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib'
+        runtime=self.payload/'Library/GPUBundles/vmtl/libvulkan_nouveau.dylib'
         runtime.write_bytes(struct.pack('<8I',0xfeedfacf,0x01000007,3,6,1,len(load),0,0)+load)
         for folder in [self.root,self.payload]:
             (folder/'nullmoth-runtime-check').write_bytes(self.guard.read_bytes())
@@ -86,9 +86,9 @@ class Install(unittest.TestCase):
         self.old={}
         for k in KEXTS:
             p=self.root/f'Library/Extensions/{k}.kext/Contents/MacOS/{k}';p.parent.mkdir(parents=True);p.write_text('old-'+k);self.old[p]=p.read_bytes()
-        for b in ['NVMTLDriver.bundle','NVIDIAShared.bundle','nvmtl']:
+        for b in ['VMTLDriver.bundle','NVIDIAShared.bundle','vmtl']:
             p=self.root/'Library/GPUBundles'/b/'fixture';p.parent.mkdir(parents=True);p.write_text('old-'+b);self.old[p]=p.read_bytes()
-        for rel,value in [('Library/GPUBundles/nvmtl-allow.txt','old-allow'),('Users/Shared/nvfw/fixture','old-firmware'),('Library/NullMoth/kexts/old-marker','old-cache'),('Library/NullMoth/os-major','15'),('Library/KernelCollections/AuxiliaryKernelExtensions.kc','OLD15-AUX')]:
+        for rel,value in [('Library/GPUBundles/vmtl-allow.txt','old-allow'),('Users/Shared/nvfw/fixture','old-firmware'),('Library/NullMoth/kexts/old-marker','old-cache'),('Library/NullMoth/os-major','15'),('Library/KernelCollections/AuxiliaryKernelExtensions.kc','OLD15-AUX')]:
             p=self.root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(value);self.old[p]=p.read_bytes()
         other=self.root/'Library/Extensions/NVMeFix.kext/fixture';other.parent.mkdir();other.write_text('unrelated');other.chmod(0o400);self.other=other
         self.bin=self.root/'bin';self.bin.mkdir()
@@ -155,9 +155,9 @@ class Install(unittest.TestCase):
         self.assertEqual(self.other.stat().st_mode&0o777,0o400)
     def test_allow_list_is_readable_by_windowserver_even_from_a_private_copy(self):
         # the privileged helper's umask 077 left the copy at 0600: WindowServer got no Metal device and aborted
-        (self.payload/'Library/GPUBundles/nvmtl-allow.txt').chmod(0o600)
+        (self.payload/'Library/GPUBundles/vmtl-allow.txt').chmod(0o600)
         r=self.run_install();self.assertEqual(r.returncode,0,r.stdout+r.stderr)
-        self.assertEqual((self.root/'Library/GPUBundles/nvmtl-allow.txt').stat().st_mode&0o777,0o644)
+        self.assertEqual((self.root/'Library/GPUBundles/vmtl-allow.txt').stat().st_mode&0o777,0o644)
     def test_external_audited_installer_keeps_archived_payload_unchanged(self):
         audited=self.root/'audited-install.sh';audited.write_bytes(self.script.read_bytes())
         self.script.write_text('#!/bin/bash\necho ARCHIVED_INSTALLER_EXECUTED\nexit 99\n')

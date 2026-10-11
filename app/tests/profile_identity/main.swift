@@ -2,7 +2,7 @@ import Foundation
 
 let rules: [String: Any] = ["rules": [
     ["id": "board-rule", "match": ["chipset": ["B650"]], "conf": ["NVRM_TEST": "1"]],
-    ["id": "live-rule", "match": ["arch": ["turing"]], "conf": ["NVMTL_TEST": "1"]]
+    ["id": "live-rule", "match": ["arch": ["turing"]], "conf": ["VMTL_TEST": "1"]]
 ]]
 let original: [String: Any] = ["arch": "turing", "cpu_vendor": "amd", "cpu": "same processor", "gpu_id": "same device"]
 let first: [String: Any] = ["chipset": "B650", "board": "BoardOne", "cpu": "same processor", "gpu_id": "same device"]

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -u
-export PATH=$HOME/nvmtl-build/rebase263/py/bin:$HOME/nvmtl-build/rebase263/bin:$HOME/tools/glslang/bin:$HOME/bin:$HOME/.cargo/bin:$HOME/Library/Python/3.9/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
-N=$HOME/nvmtl-build; S=$N/rebase263/mesa; B=$S/build263; L=$N/build.lock; O=$N/rebase263/out
+export PATH=$HOME/vmtl-build/rebase263/py/bin:$HOME/vmtl-build/rebase263/bin:$HOME/tools/glslang/bin:$HOME/bin:$HOME/.cargo/bin:$HOME/Library/Python/3.9/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+N=$HOME/vmtl-build; S=$N/rebase263/mesa; B=$S/build263; L=$N/build.lock; O=$N/rebase263/out
 [ -f "$S/VERSION" ] || { echo "STOP: no source tree at $S"; exit 2; }
 [ -e "$S/.git" ] && { echo "STOP: $S has a .git (mesa would stamp git-<sha> into the binary)"; exit 2; }
 until mkdir "$L" 2>/dev/null; do echo "waiting for build.lock ($(cat $L/owner 2>/dev/null))"; sleep 10; done

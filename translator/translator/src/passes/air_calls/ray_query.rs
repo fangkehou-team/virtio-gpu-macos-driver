@@ -789,7 +789,7 @@ impl Lowering {
             "geometry_id" => Op::RayQueryGetIntersectionGeometryIndexKHR,
             "instance_id" => Op::RayQueryGetIntersectionInstanceIdKHR,
             "user_instance_id" => Op::RayQueryGetIntersectionInstanceCustomIndexKHR,
-            "nvmtl_sbt_offset" => Op::RayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetKHR,
+            "vmtl_sbt_offset" => Op::RayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetKHR,
             "triangle_front_facing" => Op::RayQueryGetIntersectionFrontFaceKHR,
             "ray_origin" => Op::RayQueryGetIntersectionObjectRayOriginKHR,
             "ray_direction" => Op::RayQueryGetIntersectionObjectRayDirectionKHR,

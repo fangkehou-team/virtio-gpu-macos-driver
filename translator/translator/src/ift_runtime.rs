@@ -617,7 +617,7 @@ fn emit_inline(
     s.push_str(&format!(
         "  {} = {}\n",
         x("sbt"),
-        get("nvmtl_sbt_offset", "i32", false, declares)
+        get("vmtl_sbt_offset", "i32", false, declares)
     ));
     s.push_str(&format!(
         "  {} = {}\n",
@@ -833,7 +833,7 @@ mod tests {
         assert!(out.contains("call i1 @alphaTest("), "{out}");
         assert!(
             out.contains(
-                "@air.get_candidate_nvmtl_sbt_offset_intersection_query.instancing.triangle_data"
+                "@air.get_candidate_vmtl_sbt_offset_intersection_query.instancing.triangle_data"
             ),
             "{out}"
         );

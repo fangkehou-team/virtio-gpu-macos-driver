@@ -28,13 +28,13 @@ Support the work: https://buymeacoffee.com/nullmoth
 ## How it works
 
 ```
-Metal app ─► NVMTLDriver.bundle ─► translator (Apple AIR → SPIR-V) ─► NVK (Mesa Vulkan + NAK compiler) ─► kexts ─► GPU
+Metal app ─► VMTLDriver.bundle ─► translator (Apple AIR → SPIR-V) ─► NVK (Mesa Vulkan + NAK compiler) ─► kexts ─► GPU
 ```
 
 | Component | Path on disk | Source |
 |---|---|---|
-| Metal driver plugin | `/Library/GPUBundles/NVMTLDriver.bundle` | `plugin/` |
-| Shader translator | inside the plugin (`libnvmtl_translate.dylib`) | `translator/` (LGPL-3.0, based on metal2vulkan) |
+| Metal driver plugin | `/Library/GPUBundles/VMTLDriver.bundle` | `plugin/` |
+| Shader translator | inside the plugin (`libvmtl_translate.dylib`) | `translator/` (LGPL-3.0, based on metal2vulkan) |
 | Vulkan back end (NVK) | `/Library/GPUBundles/nvmtl/` | `nvk/nvk-macos.patch` on Mesa `17ca6174` |
 | Kernel extensions | `/Library/Extensions/NVRM, NVAccel, NVRMFB, NVRMAGDC` | `kexts/` |
 | GPU firmware (GSP) | `/Users/Shared/nvfw/nvidia/610.57.04` | NVIDIA, unmodified |
@@ -127,8 +127,8 @@ sudo ./uninstall.sh && sudo shutdown -r now
 Requires Xcode 16, Rust (stable), Meson/Ninja, and NVIDIA's `open-gpu-kernel-modules` at tag `610.57.04`.
 
 ```bash
-build/build_xlate.sh       # translator  -> libnvmtl_translate.dylib
-RELEASE=1 build/build_plugin.sh   # plugin -> NVMTLDriver.bundle (RELEASE=1 strips every diagnostic)
+build/build_xlate.sh       # translator  -> libvmtl_translate.dylib
+RELEASE=1 build/build_plugin.sh   # plugin -> VMTLDriver.bundle (RELEASE=1 strips every diagnostic)
 build/build263.sh          # NVK: apply nvk/nvk-macos.patch to Mesa 17ca6174 first
 build/accel_build.sh <src> <out>  # kexts
 ```

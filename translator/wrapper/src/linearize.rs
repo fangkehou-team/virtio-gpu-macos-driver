@@ -8,7 +8,7 @@ pub const LINEARIZE_SPEC_ID: u32 = 3;
 fn idr(o: &Operand) -> Option<u32> { if let Operand::IdRef(v) = o { Some(*v) } else { None } }
 
 pub fn apply(bytes: &[u8]) -> Result<(Vec<u8>, Option<&'static str>), String> {
-    if std::env::var_os("NVMTL_NO_TG_LINEARIZE").is_some() { return Ok((bytes.to_vec(), Some("NVMTL_NO_TG_LINEARIZE"))); }
+    if std::env::var_os("VMTL_NO_TG_LINEARIZE").is_some() { return Ok((bytes.to_vec(), Some("VMTL_NO_TG_LINEARIZE"))); }
     let mut m = rspirv::dr::load_bytes(bytes).map_err(|e| e.to_string())?;
     match rewrite(&mut m) {
         Ok(()) => Ok((m.assemble().iter().flat_map(|w| w.to_le_bytes()).collect(), None)),

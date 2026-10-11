@@ -162,7 +162,7 @@ func utbMap(_ ctrls: [[String: Any]], _ sel: [String: [String: Int]]) -> ([Strin
 let crashDirs = ["/Library/Logs/DiagnosticReports", NSHomeDirectory() + "/Library/Logs/DiagnosticReports"]
 let seenFile = support.appendingPathComponent("crash-seen.json")
 
-let driverImages = ["NVMTLDriver", "libnvmtl_translate", "libvulkan_nouveau", "NVIDIAShared"]
+let driverImages = ["VMTLDriver", "libvmtl_translate", "libvulkan_nouveau", "NVIDIAShared"]
 let supportCrashProcesses = ["firefox", "plugin-container", "Blender"]
 func supportCrashRank(_ name: String) -> Int? {
     if name.hasPrefix("macos-WindowServer") { return 3 }
@@ -422,7 +422,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             .split(separator: "\t").dropFirst().first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
         let kexts = sh("/usr/bin/kmutil", ["showloaded", "--list-only"]).split(separator: "\n").filter { $0.contains("com.nullmoth.") }.count
         let fm = FileManager.default
-        let files = fm.fileExists(atPath: "/Library/GPUBundles/NVMTLDriver.bundle") && fm.fileExists(atPath: "/Library/Extensions/NVRM.kext")
+        let files = fm.fileExists(atPath: "/Library/GPUBundles/VMTLDriver.bundle") && fm.fileExists(atPath: "/Library/Extensions/NVRM.kext")
         var arch = "x86_64"
         #if arch(arm64)
         arch = "arm64"

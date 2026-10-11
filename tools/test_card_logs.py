@@ -58,10 +58,10 @@ with tempfile.TemporaryDirectory(prefix="nullmoth-card-log-tests-") as directory
     assert source.count(start) == source.count(stop) == 1
     body = start + source.split(start, 1)[1].split(stop, 1)[0]
     # Redirect the optional file-log source into the isolated fixture directory.
-    assert body.count('/private/tmp/nvmtl.log') == 1
-    filelog = tmp / "nvmtl.log"
-    filelog.write_text("NVMTL: vkCreateDevice -> -8\n")
-    body = body.replace('/private/tmp/nvmtl.log', str(filelog))
+    assert body.count('/private/tmp/vmtl.log') == 1
+    filelog = tmp / "vmtl.log"
+    filelog.write_text("VMTL: vkCreateDevice -> -8\n")
+    body = body.replace('/private/tmp/vmtl.log', str(filelog))
     collection = tmp / "logs"
     collection.mkdir()
     script = tmp / "collect.sh"
