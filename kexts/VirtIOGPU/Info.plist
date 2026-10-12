@@ -18,6 +18,7 @@
 		<key>com.apple.kpi.mach</key><string>8.0</string>
 		<key>com.apple.kpi.bsd</key><string>8.0</string>
 		<key>com.apple.iokit.IOPCIFamily</key><string>1.0.0b1</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0</string>
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>
@@ -44,6 +45,28 @@
 			<!-- must beat AppleVirtIOPCITransport, whose generic 1af4 personality
 			     scores 10000 and would otherwise claim the GPU device too -->
 			<integer>20000</integer>
+			<!-- Own match category, NOT the default one. AppleVirtIO sits in the
+			     BootKC, so its generic 1af4 transport personality claims the GPU
+			     at PCI scan (IOMatchedAtBoot), long before the aux KC delivers
+			     this personality. XNU's passiveMatch then skips ours every pass:
+			     the default category is occupied and the transport has no
+			     IOPrimaryDriverTerminateOptions property, so no replacement is
+			     allowed (IOService.cpp: categoryConsumed -> break). A distinct
+			     category attaches alongside it, exactly like Apple's own
+			     IONDRVFramebuffer does on the same nub with category
+			     "IOFramebuffer". start() re-resets the device anyway. -->
+			<key>IOMatchCategory</key>
+			<string>VirtIOGPU</string>
+		</dict>
+		<key>VirtIOFB</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>io.vmtl.VirtIOGPU</string>
+			<key>IOClass</key><string>VirtIOFB</string>
+			<key>IOProviderClass</key><string>VirtIOGPU</string>
+			<!-- one framebuffer candidate per controller: without this category the
+			     firmware IONDRVFramebuffer also matches and two consoles fight -->
+			<key>IOMatchCategory</key><string>IOFramebuffer</string>
+			<key>IOProbeScore</key><integer>60000</integer>
 		</dict>
 	</dict>
 </dict>

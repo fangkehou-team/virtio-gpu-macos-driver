@@ -10,20 +10,34 @@
  *
  * Skeleton stage: device bring-up, queue negotiation and the uapi surface
  * exist; command submission (P1) fills sGoCtl/sGoQ and the hostmem BAR.
+ *
+ * P1 display: VirtIOFB (IOFramebuffer subclass, same bundle) attaches on top
+ * of the VirtIOGPU service and publishes the scanout backing store as the
+ * aperture; a 60 Hz vblank timer pushes changed frames to the host with
+ * TRANSFER_TO_HOST_2D + RESOURCE_FLUSH.
  */
 
+#include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
+#include <IOKit/graphics/IOFramebuffer.h>
+#include <IOKit/pwr_mgt/IOPMpowerState.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
+#include <kern/locks.h>
+#include <mach/mach_time.h>
 #include <mach/mach_types.h>   /* kernel_task */
 
 extern "C" {
 kern_return_t _start(kmod_info_t *ki, void *data);
 kern_return_t _stop(kmod_info_t *ki, void *data);
-KMOD_EXPLICIT_DECL(io.vmtl.VirtIOGPU, "0.1", _start, _stop)
+#ifndef VIRTIOFB_VIRTUAL
+extern "C" { KMOD_EXPLICIT_DECL(io.vmtl.VirtIOGPU, "0.1", _start, _stop) }
+#endif
 __private_extern__ kmod_start_func_t *_realmain = NULL;
 __private_extern__ kmod_stop_func_t  *_antimain = NULL;
 __private_extern__ int _kext_apple_cc = __APPLE_CC__;
@@ -251,7 +265,7 @@ struct virtio_gpu_transfer_to_host_2d {
     uint32_t padding;
 } __attribute__((packed));
 
-/* ---- one virtqueue, split-ring layout, pinned in driver memory ---- */
+/* one virtqueue, split-ring layout, pinned in driver memory */
 #define VIRTIO_MAX_QUEUES 2   /* controlq + cursorq */
 #define VQ_RING_SIZE      256
 
@@ -270,8 +284,12 @@ struct vq {
     void      *cookie[VQ_RING_SIZE];
 };
 
+/* two IOKit personalities in one bundle:
+   - VirtIOGPU claims the PCI device (probe score 20000 in the plist)
+   - VirtIOFB attaches on the VirtIOGPU service; IOMatchCategory IOFramebuffer
+     makes it the one framebuffer candidate on this controller, and a score
+     above IONDRVFramebuffer's keeps it in front of the firmware console. */
 class VirtIOGPU;
-
 class VirtIOGPUUserClient;
 
 class VirtIOGPU : public IOService {
@@ -286,6 +304,18 @@ public:
     /* uapi surface (P1): the ioctl-shaped commands */
     IOReturn uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t *outSize);
     IOReturn uapiWaitEvent(uint32_t fenceId, uint32_t timeoutUs, uint32_t *signaled);
+
+    /* ---- surface VirtIOFB (IOFramebuffer) sits on ---- */
+    /* initial state was proven with the checkerboard; now it is the
+       framebuffer backing store itself (zeroed black) */
+    uint32_t scanoutWidth()  const { return fScanoutW; }
+    uint32_t scanoutHeight() const { return fScanoutH; }
+    uint32_t scanoutRowBytes() const { return fScanoutW * 4; }
+    void *scanoutKva() const { return fFbKva; }
+    IOPhysicalAddress scanoutPhys() const { return fFbPhys; }
+    /* push (part of) the current frame to the host and repaint the display */
+    bool flushFrame(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+    /* host-side framebuffer size (dpi etc.) for the registry */
 private:
     IOPCIDevice *fPCI = nullptr;
     /* one IOMemoryMap per referenced BAR; fCommon/fIsr/fDevCfg point inside them */
@@ -309,6 +339,8 @@ private:
     IOPhysicalAddress fCtrlP = 0;
     /* 2D scanout framebuffer */
     IOBufferMemoryDescriptor *fFbMem = nullptr;
+    uint8_t *fFbKva = nullptr;
+    IOPhysicalAddress fFbPhys = 0;
     uint32_t fScanoutW = 0, fScanoutH = 0;
     uint32_t fScanoutRes = 0;   /* resource id the scanout is (to be) attached to */
     /* the work loop is created lazily by IOService; keep it mutable here */
@@ -410,6 +442,12 @@ bool VirtIOGPU::start(IOService *provider)
         probeDisplay();
         probeCapsets();
         bringUpScanout();
+        /* publish after the scanout is up so the VirtIOFB nub (matching on
+           this service) starts against a live backing store. Required for
+           the /Library/Extensions runtime-load path: kextd loads us long
+           after the PCI bus is done matching, so without registerService()
+           the fb personality never gets a second chance to attach. */
+        registerService();
     } else {
         probeDisplay();
         probeCapsets();
@@ -421,6 +459,7 @@ void VirtIOGPU::stop(IOService *provider)
 {
     if (fIntSrc) { fIntSrc->disable(); fWorkLoop->removeEventSource(fIntSrc); fIntSrc->release(); fIntSrc = nullptr; }
     if (fFbMem) { fFbMem->complete(); fFbMem->release(); fFbMem = nullptr; }
+    fFbKva = nullptr; fFbPhys = 0;
     if (fCtrlBuf) { fCtrlBuf->complete(); fCtrlBuf->release(); fCtrlBuf = nullptr; }
     fCtrlV = nullptr; fCtrlP = 0;
     for (int i = 0; i < VIRTIO_MAX_QUEUES; i++) {
@@ -706,24 +745,23 @@ bool VirtIOGPU::ctrlCmd(const void *req, uint32_t reqLen, void *resp, uint32_t r
     return true;
 }
 
-/* paint a test pattern and light up scanout 0 with a 2D resource */
+/* allocate the framebuffer backing store and light up scanout 0 with it.
+   The 64px checkerboard proved the path end to end; now the buffer is the
+   real aperture (black) that VirtIOFB publishes and WindowServer draws in. */
 bool VirtIOGPU::bringUpScanout()
 {
     const uint32_t w = fScanoutW, h = fScanoutH;
     if (!w || !h) return false;
 
-    /* backing store: one contiguous buffer, B8G8R8A8 */
+    /* backing store: one contiguous buffer, B8G8R8A8, 4k aligned */
     IOByteCount fbLen = (IOByteCount)w * h * 4;
     fFbMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
         kIODirectionInOut | kIOMemoryPhysicallyContiguous, fbLen, 4096);
     if (!fFbMem) { LOG("scanout: fb alloc %u failed", (unsigned)fbLen); return false; }
     if (fFbMem->prepare() != kIOReturnSuccess) { LOG("scanout: fb prepare failed"); fFbMem->release(); fFbMem = nullptr; return false; }
-    uint32_t *fb = (uint32_t *)fFbMem->getBytesNoCopy();
-
-    /* 64px checkerboard, cyan/orange — unambiguous on a screendump */
-    for (uint32_t y = 0; y < h; y++)
-        for (uint32_t x = 0; x < w; x++)
-            fb[y * w + x] = ((x / 64) + (y / 64)) & 1 ? 0xff00a5ff : 0xffff7f00;   /* BGRA */
+    fFbKva = (uint8_t *)fFbMem->getBytesNoCopy();
+    fFbPhys = fFbMem->getPhysicalAddress();
+    bzero(fFbKva, fbLen);
 
     /* the 2D resource already exists (created in start()); attach + scanout */
     const uint32_t resId = fScanoutRes;
@@ -738,7 +776,7 @@ bool VirtIOGPU::bringUpScanout()
     attach.ab.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
     attach.ab.resource_id = resId;
     attach.ab.nr_entries = 1;
-    attach.entry.addr = fFbMem->getPhysicalAddress();
+    attach.entry.addr = fFbPhys;
     attach.entry.length = fbLen;
     if (!ctrlCmd(&attach, sizeof(attach), &resp, sizeof(resp))) return false;
     if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) { LOG("ATTACH_BACKING: resp %#x", resp.type); return false; }
@@ -751,26 +789,41 @@ bool VirtIOGPU::bringUpScanout()
     if (!ctrlCmd(&so, sizeof(so), &resp, sizeof(resp))) return false;
     if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) { LOG("SET_SCANOUT: resp %#x", resp.type); return false; }
 
-    /* copy the whole guest-side frame into the host surface: for 2D resources
-       QEMU renders the scanout from its own pixman image, which is only filled
-       by TRANSFER_TO_HOST_2D — ATTACH_BACKING alone leaves the screen black */
+    LOG("scanout ready: %ux%u B8G8R8A8 at pa %#llx (resource %u)", w, h,
+        (unsigned long long)fFbPhys, resId);
+    return true;
+}
+
+/* copy the current guest frame into the host surface and repaint the display.
+   For 2D resources QEMU renders the scanout from its own pixman image, which
+   is only filled by TRANSFER_TO_HOST_2D; RESOURCE_FLUSH then flips it to the
+   display. A dirty-rect call keeps the idle cost at two 48-byte commands. */
+bool VirtIOGPU::flushFrame(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!fScanoutRes || !fFbKva) return false;
+    /* clamp to the resource; 0x0 means the whole frame */
+    if (x >= fScanoutW || y >= fScanoutH) return true;   /* nothing visible to do */
+    if (w == 0 || h == 0) { x = y = 0; w = fScanoutW; h = fScanoutH; }
+    if (x + w > fScanoutW) w = fScanoutW - x;
+    if (y + h > fScanoutH) h = fScanoutH - y;
+
+    struct virtio_gpu_ctrl_hdr resp = {};
+
+    /* offset into the backing store where the rect starts (linear B8G8R8A8) */
     struct virtio_gpu_transfer_to_host_2d t2d = {};
     t2d.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
-    t2d.r.width = w; t2d.r.height = h;
-    t2d.offset = 0;
-    t2d.resource_id = resId;
+    t2d.r.x = x; t2d.r.y = y; t2d.r.width = w; t2d.r.height = h;
+    t2d.offset = (uint64_t)y * (fScanoutW * 4) + (uint64_t)x * 4;
+    t2d.resource_id = fScanoutRes;
     if (!ctrlCmd(&t2d, sizeof(t2d), &resp, sizeof(resp))) return false;
     if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) { LOG("T2D: resp %#x", resp.type); return false; }
 
-    /* flush to the host display */
     struct virtio_gpu_resource_flush flush = {};
     flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
-    flush.r.width = w; flush.r.height = h;
-    flush.resource_id = resId;
+    flush.r.x = x; flush.r.y = y; flush.r.width = w; flush.r.height = h;
+    flush.resource_id = fScanoutRes;
     if (!ctrlCmd(&flush, sizeof(flush), &resp, sizeof(resp))) return false;
     if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) { LOG("FLUSH: resp %#x", resp.type); return false; }
-
-    LOG("scanout lit: %ux%u checkerboard (resource %u)", w, h, resId);
     return true;
 }
 
@@ -925,4 +978,241 @@ IOReturn VirtIOGPUUserClient::sWaitEvent(OSObject *target, void *reference, IOEx
     IOReturn r = uc->fOwner->uapiWaitEvent((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1], &signaled);
     if (r == kIOReturnSuccess) args->scalarOutput[0] = signaled;
     return r;
+}
+
+/* ======================================================================
+ * VirtIOFB — the IOFramebuffer that makes this the console display.
+ *
+ * Attaches on the VirtIOGPU service (same bundle, nub personality with
+ * IOMatchCategory IOFramebuffer so IONDRVFramebuffer cannot also take it).
+ * The aperture is the VirtIOGPU scanout backing store; WindowServer writes
+ * pixels there directly, and a 60 Hz timer pushes changed frames to the
+ * host (T2D + FLUSH — see flushFrame). Mode list is the single 1280x800
+ * mode the host surface has; display-mode negotiation (EDID, resizing)
+ * comes later.
+ *
+ * The power/vblank/connection plumbing follows NMIntelFB (same controller
+ * family answers): without the vblank timer WindowServer never completes
+ * its first frame and every display stalls, and without the power
+ * acknowledges the first WindowServer restart freezes the machine.
+ * ====================================================================== */
+
+class VirtIOFB : public IOFramebuffer {
+    OSDeclareDefaultStructors(VirtIOFB)
+public:
+    bool start(IOService *provider) override;
+    void stop(IOService *provider) override;
+
+    IOReturn enableController() override { return kIOReturnSuccess; }
+    bool isConsoleDevice() override { return true; }
+    IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;
+    const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
+    IOItemCount getDisplayModeCount() override { return 1; }
+    IOReturn getDisplayModes(IODisplayModeID *modes) override { modes[0] = 1; return kIOReturnSuccess; }
+    IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override;
+    UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
+    IOReturn getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi) override;
+    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = 1; *depth = 0; return kIOReturnSuccess; }
+    IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { return getCurrentDisplayMode(mode, depth); }
+    /* WindowServer shows the display at 0.00 Hz without a timing answer (NMIntelFB, same symptom) */
+    IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override;
+    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
+    IOItemCount getConnectionCount() override { return 1; }
+    IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **iref) override {
+        if (type == kIOFBVBLInterruptType) { fVbl = { proc, target, ref }; if (iref) *iref = &fVbl; return kIOReturnSuccess; }
+        if (type == kIOFBConnectInterruptType) { fConnect = { proc, target, ref }; if (iref) *iref = &fConnect; return kIOReturnSuccess; }
+        return kIOReturnUnsupported;
+    }
+    IOReturn unregisterInterrupt(void *) override { return kIOReturnSuccess; }
+    IOReturn setInterruptState(void *, UInt32) override { return kIOReturnSuccess; }
+    IOReturn setGammaTable(UInt32, UInt32, UInt32, void *) override { return kIOReturnSuccess; }
+    IOReturn setGammaTable(UInt32, UInt32, UInt32, void *, bool) override { return kIOReturnSuccess; }
+    IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
+    IOReturn setApertureEnable(IOPixelAperture, IOOptionBits) override { return kIOReturnSuccess; }
+    IOReturn setStartupDisplayMode(IODisplayModeID, IOIndex) override { return kIOReturnSuccess; }
+    /* Power acknowledges copied from NMIntelFB/NVRMFB: left to the base class a
+       power change queues on the shared controller thread and waits for an
+       acknowledge (45 s timeout), and the first WindowServer restart then
+       freezes every display. */
+    IOReturn setPowerState(unsigned long ordinal, IOService *) override {
+        handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+        return kIOPMAckImplied;
+    }
+    IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
+        if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
+        if (attribute == kIOPowerAttribute) {
+            if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
+                         return r == kIOReturnUnsupported ? kIOReturnSuccess : r; }
+            handleEvent(kIOFBNotifyWillPowerOff);
+            IOReturn r = IOFramebuffer::setAttribute(attribute, value);
+            return r == kIOReturnUnsupported ? kIOReturnSuccess : r;
+        }
+        return IOFramebuffer::setAttribute(attribute, value);
+    }
+    IOReturn setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t value) override {
+        switch (attribute) {
+        case kConnectionPower: case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
+        case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported: case kConnectionColorMode:
+        case kConnectionDisplayFlags: case kConnectionFlags:
+            return kIOReturnSuccess;
+        default: return IOFramebuffer::setAttributeForConnection(idx, attribute, value);
+        }
+    }
+    IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
+        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+        return kIOReturnSuccess;
+    }
+    IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
+    IOReturn getAttribute(IOSelect attribute, uintptr_t *value) override {
+        if (attribute == kIOWindowServerActiveAttribute) { if (value) *value = 1; return kIOReturnSuccess; }
+        return IOFramebuffer::getAttribute(attribute, value);
+    }
+    IOReturn getAttributeForConnection(IOIndex idx, IOSelect attr, uintptr_t *value) override {
+        if (idx != 0 || !value) return kIOReturnBadArgument;
+        switch (attr) {
+        case kConnectionEnable: case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
+        case kConnectionFlags: *value = kIOConnectionBuiltIn; return kIOReturnSuccess;
+        /* the colour answers WindowServer asks before compositing (NMIntelFB) */
+        case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
+        case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
+            *value = 0x00000002; return kIOReturnSuccess;
+        default: return IOFramebuffer::getAttributeForConnection(idx, attr, value);
+        }
+    }
+
+private:
+    VirtIOGPU *fDev = nullptr;
+    uint32_t fWidth = 0, fHeight = 0, fRowBytes = 0;
+    IODeviceMemory *fAperture = nullptr;
+    /* vblank: WindowServer paces display updates on it; without one the first
+       frame never completed and WindowServer stalled (NMIntelFB studio 10-10).
+       A 60 Hz timer is the vblank, as NVRMFB's fallback is. */
+    struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
+    Irq fVbl, fConnect;
+    thread_call_t fVblTimer = nullptr;
+    uint64_t fVblNext = 0;
+    volatile bool fStopping = false;
+    uint64_t fFrameNs = 16666667ull;   /* 60 Hz period */
+    static void vblFire(thread_call_param_t p0, thread_call_param_t) {
+        VirtIOFB *me = (VirtIOFB *)p0;
+        if (me->fStopping) return;
+        /* push the framebuffer to the host every vsync: QEMU's 2D path draws
+           the scanout from its own pixman image, fed only by
+           TRANSFER_TO_HOST_2D (full frame — partial rects re-tile rows), then
+           RESOURCE_FLUSH flips it to the display. WindowServer writes pixels
+           into the aperture between vblanks; this is the only thing that
+           makes its output visible. */
+        me->fDev->flushFrame(0, 0, me->fWidth, me->fHeight);
+        if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
+        uint64_t period; nanoseconds_to_absolutetime(me->fFrameNs, &period);
+        uint64_t now = mach_absolute_time();
+        me->fVblNext = (me->fVblNext && me->fVblNext + period > now) ? me->fVblNext + period : now + period;
+        thread_call_enter_delayed(me->fVblTimer, me->fVblNext);
+    }
+    void armVbl() {
+        fVblTimer = thread_call_allocate(vblFire, this);
+        if (fVblTimer) {
+            uint64_t d; nanoseconds_to_absolutetime(fFrameNs, &d);
+            fVblNext = mach_absolute_time() + d;
+            thread_call_enter_delayed(fVblTimer, fVblNext);
+        }
+        LOG("fb: vbl timer %s", fVblTimer ? "armed (60 Hz)" : "ALLOCATE FAILED");
+    }
+    /* the two power states: off, and on + usable */
+    static IOPMPowerState *powerStates();
+};
+
+/* the two power states NVRMFB registers: off, and on + usable */
+static IOPMPowerState sPowerStates[2] = {
+    { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+};
+IOPMPowerState *VirtIOFB::powerStates() { return sPowerStates; }
+
+#define super IOFramebuffer
+OSDefineMetaClassAndStructors(VirtIOFB, IOFramebuffer)
+
+bool VirtIOFB::start(IOService *provider)
+{
+    fDev = OSDynamicCast(VirtIOGPU, provider);
+    if (!fDev || !fDev->scanoutKva()) { LOG("fb: no VirtIOGPU scanout behind me"); return false; }
+    fWidth = fDev->scanoutWidth(); fHeight = fDev->scanoutHeight();
+    fRowBytes = fDev->scanoutRowBytes();
+
+    /* IOFBDependentID MUST be set before super::start(): IOFramebuffer::start
+       -> copyController(kDepIDCreate) creates the shared IOFBController only
+       when the property is already present (IOFramebuffer.cpp kDepIDCreate
+       branch returns NULL without it). With the controller NULL, the first PM
+       notification dies in FBLOCK (controller->fWl) -- exactly the panic
+       IOFramebuffer::powerStateWillChangeTo +0x25 at +5.5 s in v36. NVRMFB
+       sets it before super::start for the same reason (nvrm-fb.cpp). */
+    setProperty("IOFBDependentID", 0x56544C47ull /* 'VTLG' */, 64);
+    setProperty("IOFBDependentIndex", 0ull, 32);
+    setProperty("built-in", kOSBooleanTrue);
+
+    if (!IOFramebuffer::start(provider)) { LOG("fb: IOFramebuffer::start failed"); return false; }
+
+    /* the aperture is the device's backing store, already DMA-mapped */
+    fAperture = IODeviceMemory::withRange(fDev->scanoutPhys(), (IOPhysicalLength)fRowBytes * fHeight);
+    if (!fAperture) { LOG("fb: aperture IODeviceMemory failed"); return false; }
+    if (IOWorkLoop *wl = getWorkLoop()) { (void)wl; }
+    armVbl();
+    registerPowerDriver(this, powerStates(), 2);
+    LOG("fb: published %ux%u B8G8R8A8 rowbytes %u", fWidth, fHeight, fRowBytes);
+    return true;
+}
+
+void VirtIOFB::stop(IOService *provider)
+{
+    fStopping = true;
+    /* thread_call_cancel_wait is not exported to kexts: cancel and retry the
+       free until the callback is out (as NVRMFB/NMIntelFB) */
+    if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
+    if (fAperture) { fAperture->release(); fAperture = nullptr; }
+    IOFramebuffer::stop(provider);
+}
+
+IODeviceMemory *VirtIOFB::getApertureRange(IOPixelAperture aperture)
+{
+    if (aperture != kIOFBSystemAperture) return nullptr;
+    if (fAperture) { fAperture->retain(); return fAperture; }
+    return IODeviceMemory::withRange(fDev->scanoutPhys(), (IOPhysicalLength)fRowBytes * fHeight);
+}
+
+IOReturn VirtIOFB::getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info)
+{
+    if (mode != 1 || !info) return kIOReturnBadArgument;
+    bzero(info, sizeof(*info));
+    info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
+    info->refreshRate = 60 << 16;
+    info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+    return kIOReturnSuccess;
+}
+
+IOReturn VirtIOFB::getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi)
+{
+    if (mode != 1 || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
+    bzero(pi, sizeof(*pi));
+    pi->bytesPerRow = fRowBytes; pi->bytesPerPlane = 0; pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels;
+    pi->componentCount = 3; pi->bitsPerComponent = 8;
+    pi->componentMasks[0] = 0x000000FF; pi->componentMasks[1] = 0x0000FF00; pi->componentMasks[2] = 0x00FF0000;
+    strlcpy(pi->pixelFormat, IO32BitDirectPixels, sizeof(pi->pixelFormat));
+    pi->activeWidth = fWidth; pi->activeHeight = fHeight;
+    return kIOReturnSuccess;
+}
+
+IOReturn VirtIOFB::getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info)
+{
+    if (mode != 1 || !info) return kIOReturnUnsupportedMode;
+    bzero(info, sizeof(*info));
+    info->appleTimingID = kIOTimingIDInvalid;
+    /* CEA-style 1280x800@60: pixel clock 83.5 MHz, totals 1440x823 */
+    IODetailedTimingInformationV2 &d = info->detailedInfo.v2;
+    d.pixelClock = d.minPixelClock = d.maxPixelClock = 83500000ull;
+    d.horizontalActive = fWidth; d.horizontalBlanking = 160;
+    d.horizontalSyncOffset = 48; d.horizontalSyncPulseWidth = 32;
+    d.verticalActive = fHeight; d.verticalBlanking = 23;
+    d.verticalSyncOffset = 3; d.verticalSyncPulseWidth = 6;
+    info->flags = kIODetailedTimingValid;
+    return kIOReturnSuccess;
 }
