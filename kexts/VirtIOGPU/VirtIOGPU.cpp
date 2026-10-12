@@ -31,27 +31,44 @@ __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 
 #define LOG(fmt, ...) do { kprintf("VirtIOGPU: " fmt "\n", ##__VA_ARGS__); IOLog("VirtIOGPU: " fmt "\n", ##__VA_ARGS__); } while (0)
 
-/* ---- virtio PCI modern layout (virtio 1.0+, section 4.1.4) ---- */
-#define VIRTIO_PCI_COMMON_CFG_OFF   0x0   /* BAR 0: common configuration */
-#define VIRTIO_PCI_ISR_OFF          0x10  /* BAR 0: ISR status */
-#define VIRTIO_PCI_DEVICE_CFG_OFF   0x14  /* BAR 0: device-specific (virtio_gpu_config) */
+/* ---- virtio PCI layout ----
+   Transitional devices expose a legacy I/O BAR0 with fixed offsets; modern
+   (virtio 1.0, disable-legacy=on) devices instead declare the common config,
+   ISR and device config through virtio_pci_cap entries in the PCI capability
+   list, typically all inside one memory BAR (BAR4 on QEMU virtio-gpu). */
+#define VIRTIO_PCI_CAP_VENDOR        0x09
+#define VIRTIO_PCI_CAP_COMMON_CFG    1
+#define VIRTIO_PCI_CAP_NOTIFY_CFG    2
+#define VIRTIO_PCI_CAP_ISR_CFG       3
+#define VIRTIO_PCI_CAP_DEVICE_CFG    4
 
-/* common config fields (offsets within the common config structure) */
-#define CC_DEVICE_FEATURE_SELECT    0x14
-#define CC_DEVICE_FEATURE_STATUS    0x1c
-#define CC_DRIVER_FEATURE_SELECT    0x20
-#define CC_DRIVER_FEATURE_STATUS    0x28
-#define CC_MSIX_CONFIG              0x2c
-#define CC_NUM_QUEUES               0x30
-#define CC_DEVICE_STATUS            0x32
-#define CC_QUEUE_SELECT             0x34
-#define CC_QUEUE_SIZE               0x36
-#define CC_QUEUE_MSIX               0x38
-#define CC_QUEUE_ENABLE             0x3a
-#define CC_QUEUE_NOTIFY             0x3c
-#define CC_QUEUE_DESC               0x40
-#define CC_QUEUE_AVAIL              0x48
-#define CC_QUEUE_USED               0x50
+#define VIRTIO_PCI_CAP_VNDR_OFF      0
+#define VIRTIO_PCI_CAP_NEXT_OFF      1
+#define VIRTIO_PCI_CAP_LEN_OFF       2
+#define VIRTIO_PCI_CAP_TYPE_OFF      3
+#define VIRTIO_PCI_CAP_BAR_OFF       4
+#define VIRTIO_PCI_CAP_OFFSET_OFF    8   /* 24-bit little-endian (bytes 5-7 are padding) */
+#define VIRTIO_PCI_CAP_LENGTH_OFF    12  /* 32-bit little-endian */
+#define VIRTIO_PCI_CAP_NOTIFY_OFF_MULTIPLIER 16 /* 32-bit, notify cap only */
+
+/* common config fields (struct virtio_pci_common_cfg, virtio 1.0 spec 4.1.4.3;
+   x86 guest is little-endian, matching the device's LE register layout) */
+#define CC_DEVICE_FEATURE_SELECT    0x00
+#define CC_DEVICE_FEATURE_STATUS    0x04
+#define CC_DRIVER_FEATURE_SELECT    0x08
+#define CC_DRIVER_FEATURE_STATUS    0x0c
+#define CC_MSIX_CONFIG              0x10
+#define CC_NUM_QUEUES               0x12
+#define CC_DEVICE_STATUS            0x14
+#define CC_CONFIG_GENERATION        0x15
+#define CC_QUEUE_SELECT             0x16
+#define CC_QUEUE_SIZE               0x18
+#define CC_QUEUE_MSIX               0x1a
+#define CC_QUEUE_ENABLE             0x1c
+#define CC_QUEUE_NOTIFY_OFF         0x1e
+#define CC_QUEUE_DESC               0x20
+#define CC_QUEUE_AVAIL              0x28
+#define CC_QUEUE_USED               0x30
 
 #define VIRTIO_STATUS_ACK           0x01
 #define VIRTIO_STATUS_DRIVER        0x02
@@ -80,17 +97,27 @@ struct virtio_gpu_config {
         uapi surface and the queue plumbing agree on one vocabulary) ---- */
 enum virtio_gpu_ctrl_type {
     /* 2d commands */
+    /* command type values from the kernel uapi (standard-headers/linux/virtio_gpu.h).
+       Sequential enum starting at 0x0100: CREATE_2D=0x0101, UNREF=0x0102,
+       SET_SCANOUT=0x0103, FLUSH=0x0104, TRANSFER_TO_HOST_2D=0x0105,
+       ATTACH_BACKING=0x0106, DETACH_BACKING=0x0107, GET_CAPSET_INFO=0x0108,
+       GET_CAPSET=0x0109, GET_EDID=0x010a, ASSIGN_UUID=0x010b,
+       CREATE_BLOB=0x010c, SET_SCANOUT_BLOB=0x010d.
+       (v20/v21 evidence: 0x0107 read as DETACH, 0x0104 as FLUSH, 0x0105 as T2D.) */
     VIRTIO_GPU_CMD_GET_DISPLAY_INFO = 0x0100,
-    VIRTIO_GPU_CMD_GET_CAPSET_INFO  = 0x0101,
-    VIRTIO_GPU_CMD_GET_CAPSET       = 0x0102,
-    VIRTIO_GPU_CMD_RESOURCE_CREATE_2D = 0x0103,
-    VIRTIO_GPU_CMD_RESOURCE_UNREF   = 0x0104,
-    VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0105,
-    VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING = 0x0106,
-    VIRTIO_GPU_CMD_SET_SCANOUT      = 0x0107,
-    VIRTIO_GPU_CMD_RESOURCE_FLUSH   = 0x0108,
-    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB = 0x0109,
-    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB = 0x010a,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_2D = 0x0101,
+    VIRTIO_GPU_CMD_RESOURCE_UNREF   = 0x0102,
+    VIRTIO_GPU_CMD_SET_SCANOUT      = 0x0103,
+    VIRTIO_GPU_CMD_RESOURCE_FLUSH   = 0x0104,
+    VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D = 0x0105,
+    VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING = 0x0106,
+    VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING = 0x0107,
+    VIRTIO_GPU_CMD_GET_CAPSET_INFO  = 0x0108,
+    VIRTIO_GPU_CMD_GET_CAPSET       = 0x0109,
+    VIRTIO_GPU_CMD_GET_EDID         = 0x010a,
+    VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID = 0x010b,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB = 0x010c,
+    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB = 0x010d,
     /* cursor */
     VIRTIO_GPU_CMD_UPDATE_CURSOR    = 0x0300,
     VIRTIO_GPU_CMD_MOVE_CURSOR      = 0x0301,
@@ -119,6 +146,111 @@ struct vring_desc_raw {
     uint16_t next;
 } __attribute__((packed));
 
+#define VRING_DESC_F_NEXT  1   /* chain continues through next */
+#define VRING_DESC_F_WRITE 2   /* device-writable buffer */
+
+struct vring_avail_raw {
+    uint16_t flags;
+    uint16_t idx;           /* driver-owned: next ring slot to publish */
+    uint16_t ring[];        /* idx % size -> head descriptor */
+} __attribute__((packed));
+
+struct vring_used_elem_raw {
+    uint32_t id;            /* head of the completed chain */
+    uint32_t len;           /* bytes the device wrote */
+} __attribute__((packed));
+
+struct vring_used_raw {
+    uint16_t flags;
+    uint16_t idx;           /* device-owned: number of completed chains */
+    struct vring_used_elem_raw ring[];
+} __attribute__((packed));
+
+/* GET_DISPLAY_INFO request/response (virtio-gpu spec 5.2.2) */
+#define VIRTIO_GPU_MAX_SCANOUTS 16
+
+struct virtio_gpu_rect {
+    uint32_t x, y, width, height;
+} __attribute__((packed));
+
+struct virtio_gpu_display_one {
+    struct virtio_gpu_rect r;
+    uint32_t enabled;
+    uint32_t flags;
+} __attribute__((packed));
+
+struct virtio_gpu_resp_display_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_display_one pmodes[VIRTIO_GPU_MAX_SCANOUTS];
+} __attribute__((packed));
+
+/* capset enumeration (spec 5.2.2.3) */
+#define VIRTIO_GPU_CAPSET_VIRGL             1
+#define VIRTIO_GPU_CAPSET_VIRGL2            2
+#define VIRTIO_GPU_CAPSET_GFXSTREAM_VULKAN  3
+#define VIRTIO_GPU_CAPSET_VENUS             4
+#define VIRTIO_GPU_CAPSET_CROSS_DOMAIN      5
+#define VIRTIO_GPU_CAPSET_DRM               6
+
+struct virtio_gpu_get_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t capset_index;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resp_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t capset_id;
+    uint32_t capset_max_version;
+    uint32_t capset_max_size;
+    uint32_t padding;
+} __attribute__((packed));
+
+/* 2D resource / scanout plumbing (spec 5.2.2.5+) */
+#define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM 1
+
+struct virtio_gpu_resource_create_2d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t format;     /* NOTE: format before width/height (kernel uapi order) */
+    uint32_t width;
+    uint32_t height;
+} __attribute__((packed));
+
+struct virtio_gpu_resource_attach_backing {
+    struct virtio_gpu_ctrl_hdr hdr;
+    uint32_t resource_id;
+    uint32_t nr_entries;
+} __attribute__((packed));
+
+struct virtio_gpu_mem_entry {
+    uint64_t addr;
+    uint32_t length;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_set_scanout {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    uint32_t scanout_id;
+    uint32_t resource_id;
+} __attribute__((packed));
+
+struct virtio_gpu_resource_flush {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    uint32_t resource_id;
+    uint32_t padding;
+} __attribute__((packed));
+
+struct virtio_gpu_transfer_to_host_2d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_rect r;
+    uint64_t offset;
+    uint32_t resource_id;
+    uint32_t padding;
+} __attribute__((packed));
+
 /* ---- one virtqueue, split-ring layout, pinned in driver memory ---- */
 #define VIRTIO_MAX_QUEUES 2   /* controlq + cursorq */
 #define VQ_RING_SIZE      256
@@ -130,8 +262,10 @@ struct vq {
     void      *avail;
     void      *used;
     uint16_t   freeHead, freeCount;
-    uint16_t   lastUsed;
+    uint16_t   lastUsed;    /* driver-owned: next used-ring slot to reap */
+    uint16_t   availIdx;    /* driver-owned: count of published chains */
     uint16_t   availFlagsShadow;
+    uint32_t   notifyOff;   /* common-cfg value; doorbell = notify + off*mult */
     IOBufferMemoryDescriptor *descMem;   /* one allocation holds desc+avail+used, aligned */
     void      *cookie[VQ_RING_SIZE];
 };
@@ -154,16 +288,29 @@ public:
     IOReturn uapiWaitEvent(uint32_t fenceId, uint32_t timeoutUs, uint32_t *signaled);
 private:
     IOPCIDevice *fPCI = nullptr;
-    IOMemoryMap  *fBar0 = nullptr;
+    /* one IOMemoryMap per referenced BAR; fCommon/fIsr/fDevCfg point inside them */
+    IOMemoryMap  *fBarMaps[6] = {};
     volatile uint8_t *fCommon = nullptr;
     volatile uint8_t *fIsr = nullptr;
     volatile uint8_t *fDevCfg = nullptr;
+    volatile uint32_t *fNotify = nullptr;   /* notify cap: offset + multiplier */
+    uint32_t fNotifyMult = 0;
+    uint32_t fNotifyBarOff = 0;             /* notify region offset within its BAR */
 
     struct virtio_gpu_config fCfg = {};
     uint64_t fFeatures = 0;
     bool     fHasBlob = false, fHasEdid = false;
 
     vq fVq[VIRTIO_MAX_QUEUES] = {};
+    /* shared staging buffer for controlq requests/responses:
+       [0..2048) request, [2048..8192) response */
+    IOBufferMemoryDescriptor *fCtrlBuf = nullptr;
+    uint8_t *fCtrlV = nullptr;
+    IOPhysicalAddress fCtrlP = 0;
+    /* 2D scanout framebuffer */
+    IOBufferMemoryDescriptor *fFbMem = nullptr;
+    uint32_t fScanoutW = 0, fScanoutH = 0;
+    uint32_t fScanoutRes = 0;   /* resource id the scanout is (to be) attached to */
     /* the work loop is created lazily by IOService; keep it mutable here */
     mutable IOWorkLoop *fWorkLoop = nullptr;
     IOInterruptEventSource *fIntSrc = nullptr;
@@ -171,9 +318,20 @@ private:
     bool negotiateFeatures();
     bool initQueue(uint16_t index, uint16_t size);
     bool readDeviceConfig();
+    /* walk the PCI capability list and map the virtio modern regions */
+    bool locateModernRegions();
+    void dumpCommon(const char *when);
+    IOMemoryMap *barMap(uint8_t bar);
     /* P1: kick a queue and reap completions */
-    void kick(vq *q);
+    bool allocChain(vq *q, uint16_t *out, int count);   /* count contiguous free descriptors */
+    void freeDescChain(vq *q, uint16_t head);
+    bool submit(vq *q, uint16_t head);
     void reap(vq *q);
+    /* one controlq round trip through the shared staging buffer */
+    bool ctrlCmd(const void *req, uint32_t reqLen, void *resp, uint32_t respLen);
+    bool probeDisplay();
+    bool probeCapsets();
+    bool bringUpScanout();
     void interruptOccurred(IOInterruptEventSource *src, int count);
 };
 
@@ -186,9 +344,12 @@ IOService *VirtIOGPU::probe(IOService *provider, SInt32 *score)
     if (!pci) return nullptr;
     /* the plist mask is wide on purpose (any virtio display device); this gate
        accepts only virtio-gpu (0x1050) with a virtio-1.0 revision */
+    uint16_t deviceId = pci->configRead16(kIOPCIConfigDeviceID);
+    if (deviceId != 0x1050) return nullptr;
     uint8_t revision = pci->configRead8(kIOPCIConfigRevisionID);
     if (revision < 1) { kprintf("VirtIOGPU: transitional device (rev 0) not supported\n"); return nullptr; }
-    if (score) *score = 1000;
+    /* must beat AppleVirtIOPCITransport (generic 1af4 personality, score 10000) */
+    if (score) *score = 20000;
     return this;
 }
 
@@ -202,12 +363,7 @@ bool VirtIOGPU::start(IOService *provider)
     fPCI->setMemoryEnable(true);
     fPCI->setBusMasterEnable(true);   /* the device DMAs into the used ring */
 
-    fBar0 = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
-    if (!fBar0) { LOG("BAR0 map failed"); return false; }
-    volatile uint8_t *bar = (volatile uint8_t *)fBar0->getVirtualAddress();
-    fCommon = bar + VIRTIO_PCI_COMMON_CFG_OFF;
-    fIsr    = bar + VIRTIO_PCI_ISR_OFF;
-    fDevCfg = bar + VIRTIO_PCI_DEVICE_CFG_OFF;
+    if (!locateModernRegions()) { LOG("modern region location failed"); return false; }
 
     /* device reset, then acknowledge */
     fCommon[CC_DEVICE_STATUS] = 0;
@@ -222,20 +378,154 @@ bool VirtIOGPU::start(IOService *provider)
     fCommon[CC_DEVICE_STATUS] |= VIRTIO_STATUS_DRIVER_OK;
     LOG("virtio-gpu up: scanouts %u capsets %u blob %d edid %d",
         fCfg.num_scanouts, fCfg.num_capsets, fHasBlob, fHasEdid);
+
+    /* shared controlq staging buffer: [0..2048) request, [2048..8192) response */
+    fCtrlBuf = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+        kIODirectionInOut | kIOMemoryPhysicallyContiguous, 8192, 4096);
+    if (fCtrlBuf && fCtrlBuf->prepare() == kIOReturnSuccess) {
+        fCtrlV = (uint8_t *)fCtrlBuf->getBytesNoCopy();
+        fCtrlP = fCtrlBuf->getPhysicalAddress();
+        LOG("ctrl staging at pa %#llx", (unsigned long long)fCtrlP);
+    } else {
+        LOG("ctrl staging alloc failed");
+    }
+
+    /* create the scanout resource, then wire up attach + scanout + flush */
+    fScanoutW = 1280; fScanoutH = 800;
+    bool created = false;
+    {
+        struct virtio_gpu_resource_create_2d create = {};
+        struct virtio_gpu_ctrl_hdr resp = {};
+        create.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+        create.resource_id = 1;
+        create.width = fScanoutW; create.height = fScanoutH;
+        create.format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+        bool ok = ctrlCmd(&create, sizeof(create), &resp, sizeof(resp));
+        LOG("CREATE_2D res 1 %ux%u fmt %u: ok %d resp %#x",
+            fScanoutW, fScanoutH, create.format, ok, resp.type);
+        created = ok && resp.type == VIRTIO_GPU_RESP_OK_NODATA;
+    }
+    if (created) {
+        fScanoutRes = 1;
+        probeDisplay();
+        probeCapsets();
+        bringUpScanout();
+    } else {
+        probeDisplay();
+        probeCapsets();
+    }
     return true;
 }
 
 void VirtIOGPU::stop(IOService *provider)
 {
     if (fIntSrc) { fIntSrc->disable(); fWorkLoop->removeEventSource(fIntSrc); fIntSrc->release(); fIntSrc = nullptr; }
+    if (fFbMem) { fFbMem->complete(); fFbMem->release(); fFbMem = nullptr; }
+    if (fCtrlBuf) { fCtrlBuf->complete(); fCtrlBuf->release(); fCtrlBuf = nullptr; }
+    fCtrlV = nullptr; fCtrlP = 0;
     for (int i = 0; i < VIRTIO_MAX_QUEUES; i++) {
         if (fVq[i].descMem) { fVq[i].descMem->release(); fVq[i].descMem = nullptr; }
-        *(volatile uint16_t *)&fCommon[CC_QUEUE_SELECT] = (uint16_t)i;
-        *(volatile uint16_t *)&fCommon[CC_QUEUE_ENABLE] = 0;
+        if (fCommon) {
+            *(volatile uint16_t *)&fCommon[CC_QUEUE_SELECT] = (uint16_t)i;
+            *(volatile uint16_t *)&fCommon[CC_QUEUE_ENABLE] = 0;
+        }
     }
-    fCommon[CC_DEVICE_STATUS] = 0;
-    if (fBar0) { fBar0->release(); fBar0 = nullptr; }
+    if (fCommon) fCommon[CC_DEVICE_STATUS] = 0;
+    for (int i = 0; i < 6; i++) {
+        if (fBarMaps[i]) { fBarMaps[i]->release(); fBarMaps[i] = nullptr; }
+    }
+    fCommon = fIsr = fDevCfg = nullptr; fNotify = nullptr;
     super::stop(provider);
+}
+
+IOMemoryMap *VirtIOGPU::barMap(uint8_t bar)
+{
+    if (bar > 5) return nullptr;
+    if (!fBarMaps[bar]) {
+        fBarMaps[bar] = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + 4 * bar);
+        if (!fBarMaps[bar]) LOG("BAR%u map failed", bar);
+    }
+    return fBarMaps[bar];
+}
+
+void VirtIOGPU::dumpCommon(const char *when)
+{
+    LOG("common@%s: 00-07 %02x %02x %02x %02x %02x %02x %02x %02x | 08-0f %02x %02x %02x %02x %02x %02x %02x %02x",
+        when, fCommon[0], fCommon[1], fCommon[2], fCommon[3],
+        fCommon[4], fCommon[5], fCommon[6], fCommon[7],
+        fCommon[8], fCommon[9], fCommon[10], fCommon[11],
+        fCommon[12], fCommon[13], fCommon[14], fCommon[15]);
+    LOG("common@%s: 10-17 %02x %02x %02x %02x %02x %02x %02x %02x | 18-1f %02x %02x %02x %02x %02x %02x %02x %02x",
+        when, fCommon[16], fCommon[17], fCommon[18], fCommon[19],
+        fCommon[20], fCommon[21], fCommon[22], fCommon[23],
+        fCommon[24], fCommon[25], fCommon[26], fCommon[27],
+        fCommon[28], fCommon[29], fCommon[30], fCommon[31]);
+}
+
+/* virtio 1.0 section 4.1.4: the modern regions are declared by vendor
+   capabilities (cap type 9); each names a BAR, a byte offset within it and a
+   length. A device without these caps is transitional-only and unsupported. */
+bool VirtIOGPU::locateModernRegions()
+{
+    uint8_t capPtr = fPCI->configRead8(kIOPCIConfigCapabilitiesPtr);
+    bool haveCommon = false, haveIsr = false, haveDev = false, haveNotify = false;
+    for (int hops = 0; hops < 48 && capPtr; hops++) {
+        uint8_t capVendor = fPCI->configRead8(capPtr + VIRTIO_PCI_CAP_VNDR_OFF);
+        if (capVendor != VIRTIO_PCI_CAP_VENDOR) {
+            capPtr = fPCI->configRead8(capPtr + VIRTIO_PCI_CAP_NEXT_OFF);
+            continue;
+        }
+        uint8_t cfgType = fPCI->configRead8(capPtr + VIRTIO_PCI_CAP_TYPE_OFF);
+        uint8_t bar     = fPCI->configRead8(capPtr + VIRTIO_PCI_CAP_BAR_OFF);
+        uint32_t offset = fPCI->configRead32(capPtr + VIRTIO_PCI_CAP_OFFSET_OFF) & 0xffffffu;
+        uint32_t len    = fPCI->configRead32(capPtr + VIRTIO_PCI_CAP_LENGTH_OFF) & 0xffffffu;
+
+        if (cfgType > VIRTIO_PCI_CAP_DEVICE_CFG) {
+            /* shared-memory and newer cap types: not needed for P1 */
+            capPtr = fPCI->configRead8(capPtr + VIRTIO_PCI_CAP_NEXT_OFF);
+            continue;
+        }
+        LOG("cap type %u: bar %u off %#x len %#x", cfgType, bar, offset, len);
+
+        IOMemoryMap *m = barMap(bar);
+        if (!m || m->getLength() < offset + len) {
+            LOG("cap type %u: BAR%u (len %llu) too small for off %u len %u",
+                cfgType, bar, m ? (unsigned long long)m->getLength() : 0ull, offset, len);
+        } else {
+            volatile uint8_t *base = (volatile uint8_t *)m->getVirtualAddress() + offset;
+            switch (cfgType) {
+            case VIRTIO_PCI_CAP_COMMON_CFG: fCommon = base; haveCommon = true; break;
+            case VIRTIO_PCI_CAP_ISR_CFG:    fIsr    = base; haveIsr    = true; break;
+            case VIRTIO_PCI_CAP_DEVICE_CFG: fDevCfg = base; haveDev    = true; break;
+            case VIRTIO_PCI_CAP_NOTIFY_CFG:
+                fNotify = (volatile uint32_t *)base;
+                fNotifyMult = fPCI->configRead32(capPtr + VIRTIO_PCI_CAP_NOTIFY_OFF_MULTIPLIER);
+                fNotifyBarOff = offset;
+                haveNotify = true;
+                break;
+            default: break;   /* shared memory / pci alt cfg: ignore for now */
+            }
+        }
+        capPtr = fPCI->configRead8(capPtr + VIRTIO_PCI_CAP_NEXT_OFF);
+    }
+    LOG("caps: common %d isr %d devcfg %d notify %d (mult %u)",
+        haveCommon, haveIsr, haveDev, haveNotify, fNotifyMult);
+    if (haveDev) {
+        /* virtio_gpu_config: events_read, events_clear, num_scanouts, num_capsets.
+           num_scanouts must be >0; this dump also proves the BAR translation
+           works for a second, different offset. */
+        volatile struct virtio_gpu_config *dc = (volatile struct virtio_gpu_config *)fDevCfg;
+        LOG("devcfg: events_read %#x num_scanouts %u num_capsets %u",
+            dc->events_read, dc->num_scanouts, dc->num_capsets);
+    }
+    if (haveCommon) {
+        dumpCommon("pre-reset");
+        /* device reset, then acknowledge; verify the write lands */
+        fCommon[CC_DEVICE_STATUS] = 0;
+        dumpCommon("post-reset");
+        LOG("status byte after reset-write: %#x (want 0)", fCommon[CC_DEVICE_STATUS]);
+    }
+    return haveCommon && haveIsr && haveDev && haveNotify;
 }
 
 IOWorkLoop *VirtIOGPU::getWorkLoop() const
@@ -252,6 +542,7 @@ bool VirtIOGPU::negotiateFeatures()
     *(volatile uint32_t *)&fCommon[CC_DEVICE_FEATURE_SELECT] = 1;
     uint64_t hi = *(volatile uint32_t *)&fCommon[CC_DEVICE_FEATURE_STATUS];
     fFeatures = lo | (hi << 32);
+    LOG("device features: lo %#llx hi %#llx", (unsigned long long)lo, (unsigned long long)hi);
     if (!(fFeatures & (1ULL << VIRTIO_F_VERSION_1))) { LOG("not a virtio 1.0 device"); return false; }
 
     uint64_t want = (1ULL << VIRTIO_F_VERSION_1);
@@ -266,7 +557,12 @@ bool VirtIOGPU::negotiateFeatures()
     fFeatures = want;
 
     fCommon[CC_DEVICE_STATUS] |= VIRTIO_STATUS_FEATURES_OK;
-    if (!(fCommon[CC_DEVICE_STATUS] & VIRTIO_STATUS_FEATURES_OK)) return false;
+    uint8_t st = fCommon[CC_DEVICE_STATUS];
+    if (!(st & VIRTIO_STATUS_FEATURES_OK)) {
+        LOG("FEATURES_OK refused (status %#x) - device features %#llx want %#llx",
+            st, (unsigned long long)(lo | (hi << 32)), (unsigned long long)want);
+        return false;
+    }
 
     fHasBlob = (want >> VIRTIO_GPU_F_RESOURCE_BLOB) & 1;
     fHasEdid = (want >> VIRTIO_GPU_F_EDID) & 1;
@@ -286,19 +582,20 @@ bool VirtIOGPU::readDeviceConfig()
 bool VirtIOGPU::initQueue(uint16_t index, uint16_t size)
 {
     *(volatile uint16_t *)&fCommon[CC_QUEUE_SELECT] = index;
-    if (*(volatile uint16_t *)&fCommon[CC_QUEUE_SIZE] != size) {
-        LOG("queue %u: device wants size %u, driver wants %u", index,
-            *(volatile uint16_t *)&fCommon[CC_QUEUE_SIZE], size);
-        return false;
+    uint16_t devSize = *(volatile uint16_t *)&fCommon[CC_QUEUE_SIZE];
+    if (devSize == 0 || devSize > VQ_RING_SIZE) devSize = VQ_RING_SIZE;
+    if (devSize != size) {
+        LOG("queue %u: device offers %u, using that instead of %u", index, devSize, size);
+        size = devSize;
     }
     vq *q = &fVq[index];
     q->idx = index; q->size = size;
     /* desc (16*size) + avail (6 + 2*size + 2) + padding to 4k + used (6 + 8*size) */
     IOByteCount len = 16ull * size + 6ull + 2ull * size + 2ull + 4096ull + 6ull + 8ull * size;
-    q->descMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-        kIODirectionInOut | kIOMemoryPhysicallyContiguous, len, 4096ull);
-    if (!q->descMem) return false;
-    if (q->descMem->prepare() != kIOReturnSuccess) { q->descMem->release(); q->descMem = nullptr; return false; }
+    q->descMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+        kIODirectionInOut | kIOMemoryPhysicallyContiguous, len, 4096);
+    if (!q->descMem) { LOG("queue %u: ring alloc %llu bytes failed", index, (uint64_t)len); return false; }
+    if (q->descMem->prepare() != kIOReturnSuccess) { LOG("queue %u: ring prepare failed", index); q->descMem->release(); q->descMem = nullptr; return false; }
     uint8_t *v = (uint8_t *)q->descMem->getBytesNoCopy();
     IOPhysicalAddress pa = q->descMem->getPhysicalAddress();
     q->desc = v;
@@ -313,15 +610,228 @@ bool VirtIOGPU::initQueue(uint16_t index, uint16_t size)
         d->next = i + 1 < size ? i + 1 : 0xffff;
     }
     *(volatile uint16_t *)&fCommon[CC_QUEUE_SELECT] = index;
-    *(volatile uint16_t *)&fCommon[CC_QUEUE_ENABLE] = 1;
+    /* spec order: select, size, addresses, then enable */
     *(volatile uint64_t *)&fCommon[CC_QUEUE_DESC]  = pa;
     *(volatile uint64_t *)&fCommon[CC_QUEUE_AVAIL] = pa + 16ull * size;
     *(volatile uint64_t *)&fCommon[CC_QUEUE_USED]  = pa + ((uint8_t *)q->used - v);
+    q->notifyOff = *(volatile uint16_t *)&fCommon[CC_QUEUE_NOTIFY_OFF];
+    *(volatile uint16_t *)&fCommon[CC_QUEUE_ENABLE] = 1;
+    LOG("queue %u: enabled, notify off %u (doorbell bar4+%#x)", index, q->notifyOff,
+        (unsigned)(fNotifyBarOff + (uint64_t)q->notifyOff * fNotifyMult));
     return true;
 }
 
-void VirtIOGPU::kick(vq *q) { (void)q; }
-void VirtIOGPU::reap(vq *q) { (void)q; }
+/* take `count` contiguous free descriptors (split ring; our chains never
+   exceed 3, so a contiguous run is always available while freeCount >= count) */
+bool VirtIOGPU::allocChain(vq *q, uint16_t *out, int count)
+{
+    if (q->freeCount < count) return false;
+    uint16_t head = q->freeHead;
+    uint16_t cur = head;
+    for (int i = 1; i < count; i++) cur = ((struct vring_desc_raw *)q->desc)[cur].next;
+    q->freeHead = ((struct vring_desc_raw *)q->desc)[cur].next;
+    q->freeCount -= count;
+    *out = head;
+    return true;
+}
+
+void VirtIOGPU::freeDescChain(vq *q, uint16_t head)
+{
+    struct vring_desc_raw *d = (struct vring_desc_raw *)q->desc;
+    /* walk to the tail without modifying the chain */
+    uint16_t cur = head;
+    int n = 1;
+    while (n < q->size && d[cur].next != 0xffff) { cur = d[cur].next; n++; }
+    /* splice the whole chain in front of the old free list */
+    d[cur].next = q->freeHead;
+    q->freeHead = head;
+    q->freeCount += n;
+}
+
+/* publish a chain: fill avail ring entry, bump avail idx, doorbell */
+bool VirtIOGPU::submit(vq *q, uint16_t head)
+{
+    struct vring_avail_raw *a = (struct vring_avail_raw *)q->avail;
+    uint16_t slot = q->availIdx % q->size;
+    a->ring[slot] = head;
+    /* avail.idx must be visible to the device before the doorbell; the common
+       cfg doorbell write is ordered vs. our prior stores by UC semantics */
+    __asm volatile("sfence" ::: "memory");
+    q->availIdx++;
+    a->idx = q->availIdx;
+    __asm volatile("sfence" ::: "memory");
+    /* doorbell: queue's notify offset within the notify region, times multiplier */
+    *(volatile uint32_t *)((volatile uint8_t *)fNotify + (uint64_t)q->notifyOff * fNotifyMult) = q->availIdx;
+    return true;
+}
+
+/* one synchronous controlq round trip through the shared staging buffer.
+   req goes in as one descriptor; resp comes back device-writable.
+   Strictly one command in flight: wait for the used ring to reach the
+   sequence number this submission published. Completion cannot be judged
+   by freeCount -- it equals size both before the first completion and
+   after the last, so a fresh queue always looks "done" immediately. */
+bool VirtIOGPU::ctrlCmd(const void *req, uint32_t reqLen, void *resp, uint32_t respLen)
+{
+    vq *q = &fVq[0];
+    if (!fCtrlBuf || reqLen > 2048 || respLen > 6144) return false;
+
+    uint16_t head;
+    if (!allocChain(q, &head, 2)) { LOG("ctrlCmd: no free descriptors"); return false; }
+    struct vring_desc_raw *d = (struct vring_desc_raw *)q->desc;
+    uint16_t d0 = head, d1 = d[d0].next;
+    bzero(fCtrlV, reqLen);   /* clear the request side (hdr padding etc.) */
+    bcopy(req, fCtrlV, reqLen);
+    d[d0].addr = fCtrlP;
+    d[d0].len  = reqLen;
+    d[d0].flags = VRING_DESC_F_NEXT;
+    d[d0].next = d1;
+    d[d1].addr = fCtrlP + 2048;
+    d[d1].len  = respLen;
+    d[d1].flags = VRING_DESC_F_WRITE;
+    d[d1].next = 0xffff;
+    q->cookie[head] = fCtrlV + 2048;
+
+    if (!submit(q, head)) return false;
+    uint16_t seq = q->availIdx;   /* device's used.idx reaches this when our chain completes */
+
+    bool done = false;
+    for (int spin = 0; spin < 1000 && !done; spin++) {
+        reap(q);
+        done = (q->lastUsed == seq);
+        if (!done) IOSleep(1);
+    }
+    if (!done) { LOG("ctrlCmd: timeout (type %#x)", ((struct virtio_gpu_ctrl_hdr *)req)->type); return false; }
+    bcopy(fCtrlV + 2048, resp, respLen);
+    return true;
+}
+
+/* paint a test pattern and light up scanout 0 with a 2D resource */
+bool VirtIOGPU::bringUpScanout()
+{
+    const uint32_t w = fScanoutW, h = fScanoutH;
+    if (!w || !h) return false;
+
+    /* backing store: one contiguous buffer, B8G8R8A8 */
+    IOByteCount fbLen = (IOByteCount)w * h * 4;
+    fFbMem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+        kIODirectionInOut | kIOMemoryPhysicallyContiguous, fbLen, 4096);
+    if (!fFbMem) { LOG("scanout: fb alloc %u failed", (unsigned)fbLen); return false; }
+    if (fFbMem->prepare() != kIOReturnSuccess) { LOG("scanout: fb prepare failed"); fFbMem->release(); fFbMem = nullptr; return false; }
+    uint32_t *fb = (uint32_t *)fFbMem->getBytesNoCopy();
+
+    /* 64px checkerboard, cyan/orange — unambiguous on a screendump */
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+            fb[y * w + x] = ((x / 64) + (y / 64)) & 1 ? 0xff00a5ff : 0xffff7f00;   /* BGRA */
+
+    /* the 2D resource already exists (created in start()); attach + scanout */
+    const uint32_t resId = fScanoutRes;
+    if (!resId) return false;
+    struct virtio_gpu_ctrl_hdr resp = {};
+
+    /* attach the backing store (one mem entry) */
+    struct {
+        struct virtio_gpu_resource_attach_backing ab;
+        struct virtio_gpu_mem_entry entry;
+    } attach = {};
+    attach.ab.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach.ab.resource_id = resId;
+    attach.ab.nr_entries = 1;
+    attach.entry.addr = fFbMem->getPhysicalAddress();
+    attach.entry.length = fbLen;
+    if (!ctrlCmd(&attach, sizeof(attach), &resp, sizeof(resp))) return false;
+    if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) { LOG("ATTACH_BACKING: resp %#x", resp.type); return false; }
+
+    /* point scanout 0 at it, full frame (resource was created at this size) */
+    struct virtio_gpu_set_scanout so = {};
+    so.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    so.r.width = w; so.r.height = h;
+    so.scanout_id = 0; so.resource_id = resId;
+    if (!ctrlCmd(&so, sizeof(so), &resp, sizeof(resp))) return false;
+    if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) { LOG("SET_SCANOUT: resp %#x", resp.type); return false; }
+
+    /* copy the whole guest-side frame into the host surface: for 2D resources
+       QEMU renders the scanout from its own pixman image, which is only filled
+       by TRANSFER_TO_HOST_2D — ATTACH_BACKING alone leaves the screen black */
+    struct virtio_gpu_transfer_to_host_2d t2d = {};
+    t2d.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    t2d.r.width = w; t2d.r.height = h;
+    t2d.offset = 0;
+    t2d.resource_id = resId;
+    if (!ctrlCmd(&t2d, sizeof(t2d), &resp, sizeof(resp))) return false;
+    if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) { LOG("T2D: resp %#x", resp.type); return false; }
+
+    /* flush to the host display */
+    struct virtio_gpu_resource_flush flush = {};
+    flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    flush.r.width = w; flush.r.height = h;
+    flush.resource_id = resId;
+    if (!ctrlCmd(&flush, sizeof(flush), &resp, sizeof(resp))) return false;
+    if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) { LOG("FLUSH: resp %#x", resp.type); return false; }
+
+    LOG("scanout lit: %ux%u checkerboard (resource %u)", w, h, resId);
+    return true;
+}
+
+/* drain the used ring, returning cookies for completed chains */
+void VirtIOGPU::reap(vq *q)
+{
+    struct vring_used_raw *u = (struct vring_used_raw *)q->used;
+    __asm volatile("lfence" ::: "memory");
+    while (q->lastUsed != u->idx) {
+        struct vring_used_elem_raw *e = &u->ring[q->lastUsed % q->size];
+        uint16_t head = e->id;
+        q->lastUsed++;
+        void *cookie = q->cookie[head];
+        q->cookie[head] = nullptr;
+        freeDescChain(q, head);
+        /* P1: dispatch on the completion cookie's first word (ctrl_hdr.type) */
+        (void)cookie;
+    }
+}
+
+/* end-to-end proof: GET_DISPLAY_INFO over controlq */
+bool VirtIOGPU::probeDisplay()
+{
+    struct virtio_gpu_resp_display_info resp = {};
+    struct virtio_gpu_ctrl_hdr req = {};
+    req.type = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
+    if (!ctrlCmd(&req, sizeof(req), &resp, sizeof(resp))) return false;
+    if (resp.hdr.type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO) {
+        LOG("GET_DISPLAY_INFO: resp %#x", resp.hdr.type);
+        return false;
+    }
+    for (uint32_t i = 0; i < VIRTIO_GPU_MAX_SCANOUTS && i < fCfg.num_scanouts; i++)
+        LOG("scanout %u: %ux%u at (%u,%u) enabled %u", i,
+            resp.pmodes[i].r.width, resp.pmodes[i].r.height,
+            resp.pmodes[i].r.x, resp.pmodes[i].r.y, resp.pmodes[i].enabled);
+    /* pmodes[] is QEMU's *requested* state (xres/yres props), not a hardware
+       limit — this boot it reported 640x480 while the firmware GOP ran
+       1280x800. Keep fScanoutW/H at the resource size we created. */
+    return true;
+}
+
+/* enumerate capsets — Venus presence decides the P2 architecture */
+bool VirtIOGPU::probeCapsets()
+{
+    for (uint32_t i = 0; i < fCfg.num_capsets; i++) {
+        struct virtio_gpu_get_capset_info req = {};
+        struct virtio_gpu_resp_capset_info resp = {};
+        req.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+        req.capset_index = i;
+        if (!ctrlCmd(&req, sizeof(req), &resp, sizeof(resp))) return false;
+        if (resp.hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO) {
+            LOG("GET_CAPSET_INFO %u: resp %#x", i, resp.hdr.type);
+            return false;
+        }
+        LOG("capset %u: id %u version %u size %u%s", i,
+            resp.capset_id, resp.capset_max_version, resp.capset_max_size,
+            resp.capset_id == VIRTIO_GPU_CAPSET_VENUS ? "  <-- VENUS" : "");
+    }
+    if (fCfg.num_capsets == 0) LOG("no capsets (QEMU needs a Venus-enabled build for GL)");
+    return true;
+}
 void VirtIOGPU::interruptOccurred(IOInterruptEventSource *src, int count) { (void)src; (void)count; }
 
 IOReturn VirtIOGPU::uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t *outSize)

@@ -28,8 +28,8 @@
 			<key>IOProviderClass</key><string>IOPCIDevice</string>
 			<key>IOUserClientClass</key><string>VirtIOGPUUserClient</string>
 			<!-- virtio-gpu modern PCI device. IOPCIPrimaryMatch compares the 32-bit
-			     (device<<16 | vendor) word and its "value&mask" form masks it first, so
-			     0x00001050&0x0000ffff reads as "vendor 0x1af4 (Red Hat/virtio), any
+			     (device<<16 | vendor) word (same encoding NVRM uses for 0x10de), so
+			     0x00001af4&0x0000ffff reads as "vendor 0x1af4 (Red Hat/virtio), any
 			     device"; the probe() gate then accepts only device 0x1050 (virtio-gpu)
 			     with revision >= 1 (virtio 1.0). The legacy/transitional 0x0010 with
 			     revision 0 is deliberately not matched: this driver speaks only the
@@ -37,11 +37,13 @@
 			     0x03 (display) and leaves the subclass free, so both VGA (0x00) and 3D
 			     controller (0x02) match - like NVRM.kext's mask, wide ON PURPOSE. -->
 			<key>IOPCIPrimaryMatch</key>
-			<string>0x00001050&amp;0x0000ffff</string>
+			<string>0x00001af4&amp;0x0000ffff</string>
 			<key>IOPCIClassMatch</key>
 			<string>0x03000000&amp;0xff000000</string>
 			<key>IOProbeScore</key>
-			<integer>1000</integer>
+			<!-- must beat AppleVirtIOPCITransport, whose generic 1af4 personality
+			     scores 10000 and would otherwise claim the GPU device too -->
+			<integer>20000</integer>
 		</dict>
 	</dict>
 </dict>
