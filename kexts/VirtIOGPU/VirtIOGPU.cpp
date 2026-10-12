@@ -541,7 +541,10 @@ public:
        hold either 0 (data follows the struct, small payloads) or a staging
        byte offset (cmd batches up to the staging size). */
     IOReturn uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t *outSize,
-                       const void *staging, uint32_t stagingLen);
+                       const void *staging, uint32_t stagingLen, int *ctxIdx);
+    /* per-connection teardown: destroys the session's context and its bos
+       (Linux semantics: GEM handles and the drm_file's context die together) */
+    void uapiClientClosed(int *ctxIdx);
     IOReturn uapiWaitEvent(uint32_t fenceId, uint32_t timeoutUs, uint32_t *signaled);
     /* P2: memory for a mapped blob (type = bo handle) via clientMemoryForType */
     IOMemoryDescriptor *uapiMemoryForType(uint32_t type);
@@ -626,7 +629,6 @@ private:
     struct uapiCtx { bool used = false; uint32_t ctxId = 0, capsetId = 0; };
     static const uint32_t kMaxCtx = 8;
     uapiCtx fCtx[kMaxCtx];
-    uint32_t fNextCtxId = 1;
 
     /* capsets discovered by probeCapsets, for GET_CAPS + SUPPORTED_CAPSET_IDs */
     struct capsetInfo { uint32_t id, ver, size; };
@@ -642,11 +644,12 @@ private:
     bool ctrlCmdData(const void *req, uint32_t reqLen,
                      const void *data, uint32_t dataLen,
                      void *resp, uint32_t respLen);
-    bool uapiCtxCreateLocked(uint32_t capsetId, const char *name);
+    int uapiCtxCreateLocked(uint32_t capsetId, const char *name);   /* returns fCtx slot or -1 */
+    void uapiCtxDestroyLocked(int idx);
     IOReturn uapiExecbufLocked(struct drm_virtgpu_execbuffer *eb, uint32_t size,
-                               const void *staging, uint32_t stagingLen);
+                               const void *staging, uint32_t stagingLen, int ctxIdx);
     IOReturn uapiBlobCreateLocked(struct drm_virtgpu_resource_create_blob *rc, uint32_t size, uint32_t *outSize,
-                                  const void *staging, uint32_t stagingLen);
+                                  const void *staging, uint32_t stagingLen, int ctxIdx);
     IOReturn uapiGetCapsLocked(struct drm_virtgpu_get_caps *gc, uint32_t size, uint32_t *outSize,
                                const void *staging, uint32_t stagingLen);
     IOReturn uapiTransferLocked(bool toHost, struct drm_virtgpu_3d_transfer_to_host *t, uint32_t size);
@@ -1321,11 +1324,18 @@ int VirtIOGPU::capsetIndex(uint32_t id) const
     return -1;
 }
 
-bool VirtIOGPU::uapiCtxCreateLocked(uint32_t capsetId, const char *name)
+int VirtIOGPU::uapiCtxCreateLocked(uint32_t capsetId, const char *name)
 {
-    if (!fHasContextInit) return false;
-    if (fNextCtxId > kMaxCtx) { LOG("out of contexts"); return false; }
-    uint32_t ctxId = fNextCtxId++;
+    if (!fHasContextInit) return -1;
+    /* find an unused host context id (ids recycle when sessions close) */
+    uint32_t ctxId = 0;
+    for (uint32_t id = 1; id <= kMaxCtx; id++) {
+        bool taken = false;
+        for (uint32_t i = 0; i < kMaxCtx; i++)
+            if (fCtx[i].used && fCtx[i].ctxId == id) { taken = true; break; }
+        if (!taken) { ctxId = id; break; }
+    }
+    if (!ctxId) { LOG("out of contexts"); return -1; }
     struct virtio_gpu_ctx_create req = {};
     struct virtio_gpu_ctrl_hdr resp = {};
     req.hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
@@ -1336,13 +1346,25 @@ bool VirtIOGPU::uapiCtxCreateLocked(uint32_t capsetId, const char *name)
     if (!ctrlCmdData(&req, sizeof(req), nullptr, 0, &resp, sizeof(resp)) ||
         resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
         LOG("CTX_CREATE %u: resp %#x", ctxId, resp.type);
-        fNextCtxId--;
-        return false;
+        return -1;
     }
     for (uint32_t i = 0; i < kMaxCtx; i++) {
-        if (!fCtx[i].used) { fCtx[i] = { true, ctxId, capsetId }; return true; }
+        if (!fCtx[i].used) { fCtx[i] = { true, ctxId, capsetId }; return (int)i; }
     }
-    return true;
+    return -1;
+}
+
+void VirtIOGPU::uapiCtxDestroyLocked(int idx)
+{
+    if (idx < 0 || (uint32_t)idx >= kMaxCtx || !fCtx[idx].used) return;
+    struct virtio_gpu_ctrl_hdr req = {};
+    struct virtio_gpu_ctrl_hdr resp = {};
+    req.type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    req.ctx_id = fCtx[idx].ctxId;
+    if (!ctrlCmdData(&req, sizeof(req), nullptr, 0, &resp, sizeof(resp)) ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        LOG("CTX_DESTROY %u: resp %#x", req.ctx_id, resp.type);
+    fCtx[idx] = {};
 }
 
 /* MAP_BLOB: place the host3d blob in the shared-memory region at a
@@ -1403,7 +1425,7 @@ IOReturn VirtIOGPU::uapiCloseHandleLocked(uint32_t handle)
 }
 
 IOReturn VirtIOGPU::uapiExecbufLocked(struct drm_virtgpu_execbuffer *eb, uint32_t size,
-                                      const void *staging, uint32_t stagingLen)
+                                      const void *staging, uint32_t stagingLen, int ctxIdx)
 {
     if (size < sizeof(*eb) || eb->size == 0) return kIOReturnBadArgument;
     if (eb->flags & ~(VIRTGPU_EXECBUF_FENCE_FD_OUT | VIRTGPU_EXECBUF_RING_IDX)) return kIOReturnUnsupported;
@@ -1428,9 +1450,8 @@ IOReturn VirtIOGPU::uapiExecbufLocked(struct drm_virtgpu_execbuffer *eb, uint32_
         handles = (const uint32_t *)(buf + eb->size);
     }
 
-    int ctxIdx = -1;
-    for (uint32_t i = 0; i < kMaxCtx; i++) if (fCtx[i].used) { ctxIdx = (int)i; break; }
-    if (ctxIdx < 0) return kIOReturnNotOpen;
+    if (ctxIdx < 0 || (uint32_t)ctxIdx >= kMaxCtx || !fCtx[ctxIdx].used)
+        return kIOReturnNotOpen;
     uint32_t ctxId = fCtx[ctxIdx].ctxId;
 
     /* attach any handles not yet on the context (kernel does this on submit) */
@@ -1476,7 +1497,7 @@ IOReturn VirtIOGPU::uapiExecbufLocked(struct drm_virtgpu_execbuffer *eb, uint32_
 
 IOReturn VirtIOGPU::uapiBlobCreateLocked(struct drm_virtgpu_resource_create_blob *rc,
                                          uint32_t size, uint32_t *outSize,
-                                         const void *staging, uint32_t stagingLen)
+                                         const void *staging, uint32_t stagingLen, int ctxIdx)
 {
     if (size < sizeof(*rc)) return kIOReturnBadArgument;
     if (!fHasBlob) return kIOReturnUnsupported;
@@ -1503,10 +1524,9 @@ IOReturn VirtIOGPU::uapiBlobCreateLocked(struct drm_virtgpu_resource_create_blob
         }
     }
 
-    int ctxIdx = -1;
-    for (uint32_t i = 0; i < kMaxCtx; i++) if (fCtx[i].used) { ctxIdx = (int)i; break; }
-    if (host3d && ctxIdx < 0) return kIOReturnNotOpen;
-    uint32_t ctxId = ctxIdx >= 0 ? fCtx[ctxIdx].ctxId : 0;
+    bool haveCtx = ctxIdx >= 0 && (uint32_t)ctxIdx < kMaxCtx && fCtx[ctxIdx].used;
+    if (host3d && !haveCtx) return kIOReturnNotOpen;
+    uint32_t ctxId = haveCtx ? fCtx[ctxIdx].ctxId : 0;
 
     int idx = -1;
     for (uint32_t i = 1; i < kMaxBos; i++) if (!fBo[i].used) { idx = (int)i; break; }
@@ -1692,12 +1712,12 @@ IOMemoryDescriptor *VirtIOGPU::uapiMemoryForType(uint32_t type)
 }
 
 IOReturn VirtIOGPU::uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t *outSize,
-                              const void *staging, uint32_t stagingLen)
+                              const void *staging, uint32_t stagingLen, int *ctxIdx)
 {
     /* DRM ioctl encoding: nr in bits 8-15, type ('d') in bits 0-7 */
     uint32_t nr = (cmd >> 8) & 0xff;
     if (nr >= DRM_COMMAND_BASE) nr -= DRM_COMMAND_BASE;
-    if (!outSize) return kIOReturnBadArgument;
+    if (!outSize || !ctxIdx) return kIOReturnBadArgument;
     *outSize = 0;
 
     if (nr == UAPI_GETPARAM) {
@@ -1742,18 +1762,20 @@ IOReturn VirtIOGPU::uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t 
             }
         }
         if (!capsetId || capsetIndex(capsetId) < 0) { r = kIOReturnBadArgument; break; }
-        bool ok = uapiCtxCreateLocked(capsetId, "vmtl-venus");
-        r = ok ? kIOReturnSuccess : kIOReturnIOError;
+        if (*ctxIdx >= 0) { r = kIOReturnBusy; break; }   /* one context per connection (drm_file) */
+        int slot = uapiCtxCreateLocked(capsetId, "vmtl-venus");
+        if (slot >= 0) *ctxIdx = slot;
+        r = slot >= 0 ? kIOReturnSuccess : kIOReturnIOError;
         break;
     }
     case UAPI_GET_CAPS:
         r = uapiGetCapsLocked((struct drm_virtgpu_get_caps *)data, size, outSize, staging, stagingLen);
         break;
     case UAPI_RESOURCE_CREATE_BLOB:
-        r = uapiBlobCreateLocked((struct drm_virtgpu_resource_create_blob *)data, size, outSize, staging, stagingLen);
+        r = uapiBlobCreateLocked((struct drm_virtgpu_resource_create_blob *)data, size, outSize, staging, stagingLen, *ctxIdx);
         break;
     case UAPI_EXECBUFFER:
-        r = uapiExecbufLocked((struct drm_virtgpu_execbuffer *)data, size, staging, stagingLen);
+        r = uapiExecbufLocked((struct drm_virtgpu_execbuffer *)data, size, staging, stagingLen, *ctxIdx);
         break;
     case UAPI_MAP: {
         struct drm_virtgpu_map *m = (struct drm_virtgpu_map *)data;
@@ -1816,6 +1838,21 @@ IOReturn VirtIOGPU::uapiWaitEvent(uint32_t fenceId, uint32_t timeoutUs, uint32_t
     return kIOReturnSuccess;
 }
 
+void VirtIOGPU::uapiClientClosed(int *ctxIdx)
+{
+    if (!ctxIdx || *ctxIdx < 0) return;
+    if (fUapiLock) IORecursiveLockLock(fUapiLock);
+    uint32_t ctxId = (uint32_t)*ctxIdx < kMaxCtx ? fCtx[*ctxIdx].ctxId : 0;
+    /* release the session's bos (drm_file close drops its GEM handles) */
+    for (uint32_t i = 1; i < kMaxBos; i++) {
+        if (fBo[i].used && fBo[i].ctxId == ctxId)
+            uapiCloseHandleLocked(i);
+    }
+    uapiCtxDestroyLocked(*ctxIdx);
+    *ctxIdx = -1;
+    if (fUapiLock) IORecursiveLockUnlock(fUapiLock);
+}
+
 /* ---- user client: the Linux-uapi-shaped surface ---- */
 enum { SEL_IOCTL = 0, SEL_WAITEVENT = 1 };
 
@@ -1834,6 +1871,9 @@ public:
 private:
     VirtIOGPU *fOwner = nullptr;
     task_t fTask = nullptr;
+    /* this connection's context slot in the owner's fCtx[] (-1 = none);
+       set by CONTEXT_INIT, cleared by uapiClientClosed */
+    int fCtxIdx = -1;
     static const uint32_t kStagingLen = 512 * 1024;
     IOBufferMemoryDescriptor *fStaging = nullptr;
     static IOReturn sIoctl(OSObject *target, void *reference, IOExternalMethodArguments *args);
@@ -1864,6 +1904,9 @@ bool VirtIOGPUUserClient::start(IOService *provider)
 IOReturn VirtIOGPUUserClient::clientClose(void)
 {
     if (fStaging) { fStaging->complete(); fStaging->release(); fStaging = nullptr; }
+    /* runs on graceful close and on process death (SIGSEGV included):
+       without this a crashed client leaves its host context poisoned */
+    if (fOwner) fOwner->uapiClientClosed(&fCtxIdx);
     fOwner = nullptr;
     terminate();
     return kIOReturnSuccess;
@@ -1893,7 +1936,7 @@ IOReturn VirtIOGPUUserClient::sIoctl(OSObject *target, void *reference, IOExtern
     IOReturn r = uc->fOwner->uapiIoctl(cmd, (void *)(uintptr_t)args->structureInput,
                                        (uint32_t)args->structureInputSize, &outLen,
                                        uc->fStaging ? uc->fStaging->getBytesNoCopy() : nullptr,
-                                       uc->fStaging ? kStagingLen : 0);
+                                       uc->fStaging ? kStagingLen : 0, &uc->fCtxIdx);
     if (r == kIOReturnSuccess) {
         if (outLen) {
             /* uapiIoctl mutates the input copy (getparam->value, map->offset,
