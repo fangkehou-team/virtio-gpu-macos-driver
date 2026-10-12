@@ -158,7 +158,8 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_RESP_OK_CAPSET_INFO  = 0x1102,
     VIRTIO_GPU_RESP_OK_CAPSET       = 0x1103,
     VIRTIO_GPU_RESP_OK_EDID         = 0x1104,
-    VIRTIO_GPU_RESP_OK_MAP_INFO     = 0x1105,
+    VIRTIO_GPU_RESP_OK_RESOURCE_UUID = 0x1105,
+    VIRTIO_GPU_RESP_OK_MAP_INFO     = 0x1106,
     VIRTIO_GPU_RESP_ERR_UNSPEC      = 0x1200,
 };
 
@@ -616,7 +617,9 @@ private:
     };
     static const uint32_t kMaxBos = 256;
     uapiBo fBo[kMaxBos];
-    uint32_t fNextResId = 2, fNextHandle = 1;   /* res 1 = scanout */
+    /* uapi resources start high: ids 1..kMaxScanout are owned by the 2D
+       scanout path, and the host keeps one global resource-id namespace */
+    uint32_t fNextResId = 0x100, fNextHandle = 1;
     uint32_t fNextFenceCookie = 0x40000000;
 
     struct uapiCtx { bool used = false; uint32_t ctxId = 0, capsetId = 0; };
@@ -1589,10 +1592,8 @@ IOReturn VirtIOGPU::uapiBlobCreateLocked(struct drm_virtgpu_resource_create_blob
             return kIOReturnIOError;
         }
         bo->attached = true;
-        /* map mappable host blobs eagerly (the kernel defers, but nothing
-           in the venus path benefits: the shmem rsp blob is mapped right away) */
-        if (rc->blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE)
-            uapiMapBlobLocked(bo);
+        /* NB: the kernel defers MAP_BLOB to the MAP ioctl; doing it here
+           would consume the resource's one-shot host-side map state */
     }
 
     rc->bo_handle = handle;
@@ -1675,8 +1676,14 @@ IOMemoryDescriptor *VirtIOGPU::uapiMemoryForType(uint32_t type)
             md = bo->guestMem;
             md->retain();
         } else if (bo->mapped) {
+            /* physical (MMIO) range: task must be NULL — kernel_task makes
+               this a virtual-kernel-address descriptor and the user map fails
+               with kIOReturnNoDevice (see NVRM's clientMemoryForType) */
             md = IOMemoryDescriptor::withAddressRange(bo->shmPa, bo->size,
-                kIODirectionInOut, kernel_task);
+                kIODirectionInOut, nullptr);
+            if (!md)
+                LOG("uapiMemoryForType %u: withAddressRange failed pa %#llx len %llu",
+                    type, (unsigned long long)bo->shmPa, (unsigned long long)bo->size);
         }
     }
     if (fUapiLock) IORecursiveLockUnlock(fUapiLock);
@@ -1686,7 +1693,8 @@ IOMemoryDescriptor *VirtIOGPU::uapiMemoryForType(uint32_t type)
 IOReturn VirtIOGPU::uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t *outSize,
                               const void *staging, uint32_t stagingLen)
 {
-    uint32_t nr = (cmd & 0xff);
+    /* DRM ioctl encoding: nr in bits 8-15, type ('d') in bits 0-7 */
+    uint32_t nr = (cmd >> 8) & 0xff;
     if (nr >= DRM_COMMAND_BASE) nr -= DRM_COMMAND_BASE;
     if (!outSize) return kIOReturnBadArgument;
     *outSize = 0;
@@ -1877,7 +1885,19 @@ IOReturn VirtIOGPUUserClient::sIoctl(OSObject *target, void *reference, IOExtern
                                        (uint32_t)args->structureInputSize, &outLen,
                                        uc->fStaging ? uc->fStaging->getBytesNoCopy() : nullptr,
                                        uc->fStaging ? kStagingLen : 0);
-    if (r == kIOReturnSuccess && outLen) args->structureOutputSize = outLen;
+    if (r == kIOReturnSuccess) {
+        if (outLen) {
+            /* uapiIoctl mutates the input copy (getparam->value, map->offset,
+               blob->bo_handle, ...). structureInput and structureOutput are
+               distinct kernel buffers, so ship the mutation to the caller. */
+            if (args->structureOutput && args->structureOutputSize >= outLen)
+                memcpy(args->structureOutput, (const void *)(uintptr_t)args->structureInput, outLen);
+        }
+        /* always publish outLen (0 = staging mode, no copy-back): leaving the
+           dispatch's default count would clobber the caller's buffer with
+           zeroed output bytes */
+        args->structureOutputSize = outLen;
+    }
     return r;
 }
 
