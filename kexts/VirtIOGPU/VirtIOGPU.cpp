@@ -380,6 +380,7 @@ enum {   /* nr values 1..11 (DRM_VIRTGPU_*) */
     UAPI_GET_CAPS = 0x09,
     UAPI_RESOURCE_CREATE_BLOB = 0x0a,
     UAPI_CONTEXT_INIT = 0x0b,
+    UAPI_GEM_CLOSE = 0x0c,
 };
 
 #define VIRTGPU_PARAM_3D_FEATURES 1
@@ -1788,6 +1789,14 @@ IOReturn VirtIOGPU::uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t 
     case UAPI_WAIT: {
         /* submissions complete synchronously; bos are always idle */
         r = size >= sizeof(struct drm_virtgpu_3d_wait) ? kIOReturnSuccess : kIOReturnBadArgument;
+        break;
+    }
+    case UAPI_GEM_CLOSE: {
+        struct GemCloseArgs { uint32_t handle; uint32_t pad; };
+        GemCloseArgs *gc = (GemCloseArgs *)data;
+        if (size < sizeof(*gc)) { r = kIOReturnBadArgument; break; }
+        /* unknown handle: Linux GEM close is a no-op for foreign handles */
+        r = boLookup(gc->handle) < 0 ? kIOReturnSuccess : uapiCloseHandleLocked(gc->handle);
         break;
     }
     case UAPI_RESOURCE_CREATE:
