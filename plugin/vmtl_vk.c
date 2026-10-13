@@ -338,6 +338,7 @@ static VkResult vmtl_opaque_AllocateCommandBuffers(VkDevice dev, const VkCommand
 typedef struct { uint32_t version, surfaceID, plane, pad; uint64_t size_B; } vmtl_vram_rec;
 static void (*pnvk_stage_import)(const vmtl_vram_rec *);
 static uint32_t (*pnvk_surface_dirty)(VkDevice, uint32_t, uint32_t);
+static int (*pnvk_unified_mem)(void);
 static int (*pnvk_sparse)(void);
 static int g_qsparse, g_sparse;
 static int g_extfd;
@@ -580,6 +581,7 @@ static int vmtl_vk_initialize(void)
             nvlog("vk: driver opened directly: %s (image %s)", VMTL_ICD_LIB, vmtl_image_ident((const void *)pvkGetInstanceProcAddr, vid, sizeof vid));
             pnvk_stage_import = (void (*)(const vmtl_vram_rec *))dlsym(g_lib, "vmtl_nvk_stage_import");
             pnvk_surface_dirty = (uint32_t (*)(VkDevice, uint32_t, uint32_t))dlsym(g_lib, "vmtl_nvk_surface_dirty");
+            pnvk_unified_mem = (int (*)(void))dlsym(g_lib, "vmtl_nvk_unified_mem_v1");
             pnvk_sample_depth_contract = (VkResult (*)(VkDevice, uint32_t *, uint32_t *))dlsym(g_lib, "vmtl_nvk_sample_depth_contract_v1");
             pnvk_sample_depth_image = (VkResult (*)(VkDevice, VkImage, uint32_t *))dlsym(g_lib, "vmtl_nvk_sample_depth_image_v1");
             pnvk_sparse = (int (*)(void))dlsym(g_lib, "vmtl_nvk_sparse_bind_v1");
@@ -1094,6 +1096,7 @@ static int vmtl_vk_buffer_create_sparse(size_t size, nvk_buffer *out)
         return -1;
     }
     out->buf = b; out->mem = m; out->size = size; out->alloc = mr.size; out->sparse = 1; out->sysmem = sys;
+    out->memtype = (int)mai.memoryTypeIndex;
     g_alloc_bytes += mr.size; g_buf_made++; g_res3_made++;
     if (!sys) vmtl_vk_budget_charge(mr.size);
     else { g_res3_madesys++; g_buf_vram_refused++;
@@ -1150,7 +1153,7 @@ static int vmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer 
         VkResult r2 = r1 == VK_SUCCESS ? pvkMapMemory(g_dev, bm, 0, VK_WHOLE_SIZE, 0, &bp) : r1;
         VkResult r3 = r2 == VK_SUCCESS ? pvkBindBufferMemory(g_dev, out->buf, bm, 0) : r2;
         if (r3 == VK_SUCCESS) {
-            out->mem = bm; out->map = bp; out->alloc = mr.size; out->bar1 = 1; g_alloc_bytes += mr.size; g_bar1_bytes += mr.size; g_buf_made++;
+            out->mem = bm; out->map = bp; out->alloc = mr.size; out->bar1 = 1; out->memtype = bt; g_alloc_bytes += mr.size; g_bar1_bytes += mr.size; g_buf_made++;
             { static int said; if (!said++) nvlog("vk: shared buffer of %zu bytes placed in VRAM through BAR1 (type %d)", size, bt); }
             return 0; }
         if (bp) pvkUnmapMemory(g_dev, bm);
@@ -1181,6 +1184,7 @@ static int vmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer 
         }
     } else VKCK(vmtl_opaque_AllocateMemory(g_dev, &mai, NULL, &out->mem), "vkAllocateMemory(buffer)");
     out->alloc = mr.size;
+    out->memtype = mt;
     if (!host_visible) vmtl_vk_budget_charge(mr.size);
     VKCK(pvkBindBufferMemory(g_dev, out->buf, out->mem, 0), "vkBindBufferMemory");
     if (host_visible) { VkResult mr_ = pvkMapMemory(g_dev, out->mem, 0, VK_WHOLE_SIZE, 0, &out->map); if (mr_ != VK_SUCCESS) {
@@ -1260,7 +1264,7 @@ int vmtl_vk_buffer_import_host(void *ptr, size_t size, nvk_buffer *out)
         nvlog("vk: vkBindBufferMemory refused the imported allocation");
         pvkFreeMemory(g_dev, (VkDeviceMemory)out->mem, NULL); pvkDestroyBuffer(g_dev, (VkBuffer)out->buf, NULL);
         out->buf = NULL; out->mem = NULL; return -1; }
-    out->map = ptr; out->alloc = size; out->imported = 1;
+    out->map = ptr; out->alloc = size; out->imported = 1; out->memtype = mt;
     g_alloc_bytes += size; g_buf_made++;
     { static int said; if (!said++) nvlog("vk: imported the caller's pages as device memory — %zu bytes at %p, memory type %d", size, ptr, mt); }
     return 0;
@@ -1691,11 +1695,18 @@ static int vmtl_vk_image_create_typed_lifetime_body(uint32_t w, uint32_t h, uint
 /* A GPU with no display of its own (laptops whose screen is on the Intel or AMD GPU; the kernel sets
    debug.nvaccel_headless) hands frames to that GPU's WindowServer, which reads an IOSurface from system memory and
    cannot page our VRAM copy off. Apple's two-GPU Macs copy the discrete GPU's frames the same way. So on such a GPU,
-   IOSurface textures are private per process and copied out after every GPU write. */
+   IOSurface textures are private per process and copied out after every GPU write.
+   On the vmtl ICD (dlsym vmtl_nvk_unified_mem_v1) device memory IS system memory — a staged
+   import lands on the surface's own pages — so there is no card-local copy to go stale and headless must not close
+   the share gates (P4.2, design doc 4.5). WindowServer's device exclusion reads the sysctl itself and stays. */
 static int vmtl_gpu_headless(void)
 {
     static int h = -1;
     if (h < 0) { int v = 0; size_t n = sizeof v; h = sysctlbyname("debug.nvaccel_headless", &v, &n, NULL, 0) == 0 && v;
+                 if (h && pnvk_unified_mem && pnvk_unified_mem()) {
+                     nvlog("headless GPU, but this ICD reports unified memory (device memory is the surface's pages): IOSurface sharing stays on");
+                     h = 0;
+                 }
                  if (h) nvlog("headless GPU: the display belongs to another GPU - IOSurfaces are copied out to system memory"); }
     return h;
 }
@@ -1757,7 +1768,7 @@ int vmtl_vk_surface_vram(uint32_t surfaceID, uint32_t plane, size_t need, nvk_bu
         nvlog("item 7: surface %u: a buffer over the imported VRAM was refused - private", surfaceID);
         return -1;
     }
-    out->buf = b; out->mem = m; out->size = need; out->alloc = 0; out->imported = 1;
+    out->buf = b; out->mem = m; out->size = need; out->alloc = 0; out->imported = 1; out->memtype = mt;
     g_buf_made++;
     return 0;
 }
@@ -5397,7 +5408,7 @@ int vmtl_vk_buffer_migrate(nvk_buffer *b, int to_sysmem)
     g_alloc_bytes -= b->alloc; g_alloc_bytes += mr.size;
     if (to_sysmem) { g_res3_off++; g_res3_off_b += b->alloc; }
     else { vmtl_vk_budget_charge(mr.size); g_res3_on++; g_res3_on_b += mr.size; }
-    b->mem = nm; b->alloc = mr.size; b->sysmem = to_sysmem ? 1 : 0;
+    b->mem = nm; b->alloc = mr.size; b->sysmem = to_sysmem ? 1 : 0; b->memtype = mt;
     return 0;
 }
 
@@ -6466,6 +6477,7 @@ int vmtl_vk_buffer_create_placed(size_t size, nvk_heap *heap, size_t offset, nvk
     }
     out->mem = heap->mem; out->placed = 1; out->alloc = 0;
     out->moff = offset;
+    out->memtype = (int)heap->memtype;
     out->map = heap->map ? (char *)heap->map + offset : NULL;
     g_buf_made++;
     return 0;
@@ -6547,12 +6559,13 @@ static int vmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t 
             pvkDestroyImage(g_dev, (VkImage)out->img, NULL); memset(out, 0, sizeof *out); return -1; }
     }
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, (VkImage)out->img, &mr);
-    uint32_t all = g_memp.memoryTypeCount >= 32 ? 0xffffffffu : ((1u << g_memp.memoryTypeCount) - 1u);
     size_t at = b->moff + offset;
-    const char *why = (mr.memoryTypeBits & all) != all ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
+    int bmt = b->memtype;
+    const char *why = (bmt < 0 || (uint32_t)bmt >= g_memp.memoryTypeCount || !(mr.memoryTypeBits & (1u << bmt)))
+                      ? "memory types" : (mr.alignment && at % mr.alignment) ? "alignment" : NULL;
     if (why) {
-        nvlog("buffer texture: refused on %s - image types 0x%x of 0x%x, bind at %zu (buffer %zu + %zu) vs alignment %llu",
-              why, mr.memoryTypeBits, all, at, b->moff, offset, (unsigned long long)mr.alignment);
+        nvlog("buffer texture: refused on %s - image types 0x%x, the buffer's type %d of %u, bind at %zu (buffer %zu + %zu) vs alignment %llu",
+              why, mr.memoryTypeBits, bmt, g_memp.memoryTypeCount, at, b->moff, offset, (unsigned long long)mr.alignment);
         pvkDestroyImage(g_dev, (VkImage)out->img, NULL); memset(out, 0, sizeof *out); return -1; }
     if (mr.size > b->size - offset)
         nvlog("buffer texture: image size %llu runs %llu B past the buffer's %zu at offset %zu (the tail of the last row, never addressed)",
@@ -6565,8 +6578,8 @@ static int vmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t 
         (VkFormat)vkfmt, swz, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
     VKCK(vmtl_opaque_CreateImageView(g_dev, &vci, NULL, &out->view), "vkCreateImageView(buffer texture)");
 
-    nvlog("buffer texture: %ux%u VkFormat %u pitch %zu bound at %zu (%s, align %llu, size %llu, storage %d, render %d, view pair %u)", w, h, vkfmt, row_pitch, at,
-          g_linmod ? "DRM linear" : "LINEAR", (unsigned long long)mr.alignment, (unsigned long long)mr.size, storage, render, out->vpair);
+    nvlog("buffer texture: %ux%u VkFormat %u pitch %zu bound at %zu (type %d, %s, align %llu, size %llu, storage %d, render %d, view pair %u)", w, h, vkfmt, row_pitch, at,
+          bmt, g_linmod ? "DRM linear" : "LINEAR", (unsigned long long)mr.alignment, (unsigned long long)mr.size, storage, render, out->vpair);
     return 0;
 }
 

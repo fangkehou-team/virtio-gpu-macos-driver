@@ -8,7 +8,7 @@
 #include <stdint.h>
 #include <stddef.h>
 const char *vmtl_image_ident(const void *addr, char *out, size_t n);
-typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; } nvk_buffer;
+typedef struct { void *buf; void *mem; void *map; size_t size; size_t alloc; int placed; void *pool; size_t poff; int imported; int bar1; size_t moff; int sparse, sysmem; int memtype; } nvk_buffer;
 #include "vmtl_sample_positions.h"
 typedef struct { void *img; void *mem; void *view; uint32_t w, h; size_t alloc; uint32_t layout; uint32_t mips; uint32_t fmt, bpp; uint32_t storage, mtl_type, layers; int placed; uint32_t bw, bh; uint32_t samples; uint32_t sysmem; uint32_t vkflags, usage;  uint32_t vpair;  } nvk_image;
 #define VMTL_NVAR 16
