@@ -23,6 +23,9 @@
 		     personality): it reads IOAccelerator/IOGraphicsAccelerator2
 		     metaclass sizes via their OSMetaClass symbols -->
 		<key>com.apple.iokit.IOAcceleratorFamily2</key><string>2.0.0</string>
+		<!-- P4 STAGE_IMPORT: resolves the IOSurfaceRoot/IOSurface mangled
+		     symbols declared in VirtIOGPU.cpp -->
+		<key>com.apple.iokit.IOSurface</key><string>1.0</string>
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>

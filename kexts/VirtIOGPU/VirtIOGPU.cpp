@@ -32,6 +32,16 @@
 #include <mach/mach_time.h>
 #include <mach/mach_types.h>   /* kernel_task */
 
+/* P4: IOSurface kext C++ symbols, exported by com.apple.iokit.IOSurface
+   (link trick borrowed from kexts/NVRM/accel/nvrm-accel.cpp:1116 — declare
+   the mangled names, depend on the kext in Info.plist OSBundleLibraries).
+   lookupSurface returns the surface retained; getMemoryDescriptor's
+   descriptor is borrowed from the surface. */
+extern "C" {
+void *_ZN13IOSurfaceRoot13lookupSurfaceEjP4task(void *root, unsigned int id, task_t task);
+void *_ZNK9IOSurface19getMemoryDescriptorEv(void *surface);
+}
+
 extern "C" {
 kern_return_t _start(kmod_info_t *ki, void *data);
 kern_return_t _stop(kmod_info_t *ki, void *data);
@@ -381,6 +391,9 @@ enum {   /* nr values 1..11 (DRM_VIRTGPU_*) */
     UAPI_RESOURCE_CREATE_BLOB = 0x0a,
     UAPI_CONTEXT_INIT = 0x0b,
     UAPI_GEM_CLOSE = 0x0c,
+    /* vmtl extension (not upstream virtgpu): register an IOSurface's pages
+       as a GUEST blob resource — the P4 zero-copy path */
+    UAPI_STAGE_IMPORT = 0x0d,
 };
 
 #define VIRTGPU_PARAM_3D_FEATURES 1
@@ -494,6 +507,19 @@ struct drm_virtgpu_context_set_param {
     uint64_t value;
 } __attribute__((packed));
 
+/* vmtl extension: STAGE_IMPORT request/response (mirrors the plugin's
+   vmtl_vram_rec intent — surface + plane in, resource/handle out) */
+struct vmtl_stage_import {
+    uint64_t surface_id;
+    uint64_t need;          /* required bytes, 0 = whole surface */
+    uint32_t plane;         /* unused: single-plane surfaces only */
+    uint32_t pad;
+    uint32_t res_handle;    /* out: virtio resource id */
+    uint32_t bo_handle;     /* out: GEM handle */
+    uint32_t size;          /* out: backing size in bytes */
+    uint32_t pad2;
+} __attribute__((packed));
+
 struct drm_virtgpu_context_init {
     uint32_t num_params;
     uint32_t pad;
@@ -541,7 +567,7 @@ public:
        hold either 0 (data follows the struct, small payloads) or a staging
        byte offset (cmd batches up to the staging size). */
     IOReturn uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t *outSize,
-                       const void *staging, uint32_t stagingLen, int *ctxIdx);
+                       const void *staging, uint32_t stagingLen, int *ctxIdx, task_t task);
     /* per-connection teardown: destroys the session's context and its bos
        (Linux semantics: GEM handles and the drm_file's context die together) */
     void uapiClientClosed(int *ctxIdx);
@@ -624,6 +650,10 @@ private:
         IOPhysicalAddress shmPa = 0;
         IOBufferMemoryDescriptor *guestMem = nullptr;   /* GUEST/HOST3D_GUEST backing */
         IOPhysicalAddress guestPa = 0;
+        /* STAGE_IMPORT: the IOSurface whose pages back this blob (both
+           retained; the descriptor is the surface's borrowed one) */
+        OSObject *surfObj = nullptr;
+        IOMemoryDescriptor *surfMem = nullptr;
     };
     static const uint32_t kMaxBos = 256;
     uapiBo fBo[kMaxBos];
@@ -656,6 +686,9 @@ private:
                                const void *staging, uint32_t stagingLen, int ctxIdx);
     IOReturn uapiBlobCreateLocked(struct drm_virtgpu_resource_create_blob *rc, uint32_t size, uint32_t *outSize,
                                   const void *staging, uint32_t stagingLen, int ctxIdx);
+    /* P4: STAGE_IMPORT — publish an IOSurface's pages as a GUEST blob */
+    IOReturn uapiStageImportLocked(struct vmtl_stage_import *si, uint32_t size,
+                                   uint32_t *outSize, task_t task, int ctxIdx);
     IOReturn uapiGetCapsLocked(struct drm_virtgpu_get_caps *gc, uint32_t size, uint32_t *outSize,
                                const void *staging, uint32_t stagingLen);
     IOReturn uapiTransferLocked(bool toHost, struct drm_virtgpu_3d_transfer_to_host *t, uint32_t size);
@@ -1491,6 +1524,8 @@ IOReturn VirtIOGPU::uapiCloseHandleLocked(uint32_t handle)
     unref.resource_id = bo->resId;
     ctrlCmdData(&unref, sizeof(unref), nullptr, 0, &resp, sizeof(resp));
     if (bo->guestMem) { bo->guestMem->complete(); bo->guestMem->release(); bo->guestMem = nullptr; }
+    if (bo->surfMem) { bo->surfMem->complete(); bo->surfMem->release(); bo->surfMem = nullptr; }
+    if (bo->surfObj) { bo->surfObj->release(); bo->surfObj = nullptr; }
     if (wasMapped) uapiShmFreeLocked(shmOff, shmSize);
     *bo = {};
     return kIOReturnSuccess;
@@ -1695,6 +1730,133 @@ IOReturn VirtIOGPU::uapiBlobCreateLocked(struct drm_virtgpu_resource_create_blob
     return kIOReturnSuccess;
 }
 
+/* P4 STAGE_IMPORT: publish an IOSurface's backing pages as a GUEST blob.
+   QEMU folds the mem entries into a udmabuf, the render server imports it
+   as VkDeviceMemory, and the host GPU renders straight into the surface's
+   pages — no copy-out (docs/P4-DESIGN.md).  Single-plane; the surface's
+   pages are already wired, and we prepare() its descriptor for the blob's
+   lifetime.  blobFlags: SHAREABLE only — GUEST memory is the caller's own
+   pages, so the BAR-mapping MAP_BLOB path does not apply. */
+IOReturn VirtIOGPU::uapiStageImportLocked(struct vmtl_stage_import *si, uint32_t size,
+                                          uint32_t *outSize, task_t task, int ctxIdx)
+{
+    if (size < sizeof(*si)) return kIOReturnBadArgument;
+    if (!task) return kIOReturnNotPrivileged;
+    if (ctxIdx < 0 || (uint32_t)ctxIdx >= kMaxCtx || !fCtx[ctxIdx].used)
+        return kIOReturnNotOpen;
+    if (!fHasBlob) return kIOReturnUnsupported;
+
+    static IOService *gVIOSurfRoot;
+    if (!gVIOSurfRoot) {
+        OSDictionary *m = IOService::serviceMatching("IOSurfaceRoot");
+        if (m) { gVIOSurfRoot = IOService::waitForMatchingService(m, 5ULL * 1000 * 1000 * 1000); m->release(); }
+        if (!gVIOSurfRoot) return kIOReturnNotAttached;
+    }
+    OSObject *surf = (OSObject *)_ZN13IOSurfaceRoot13lookupSurfaceEjP4task(
+        gVIOSurfRoot, (unsigned int)si->surface_id, task);
+    if (!surf) return kIOReturnBadArgument;
+
+    IOMemoryDescriptor *md = (IOMemoryDescriptor *)_ZNK9IOSurface19getMemoryDescriptorEv(surf);
+    if (!md) { surf->release(); return kIOReturnNoMemory; }
+    if (md->prepare(kIODirectionNone) != kIOReturnSuccess) {
+        surf->release();
+        return kIOReturnVMError;
+    }
+    const uint64_t total = md->getLength();
+    if (!total || total > (1ull << 30) || (si->need && si->need > total)) {
+        md->complete();
+        surf->release();
+        return kIOReturnNoSpace;
+    }
+
+    /* walk physical segments, coalescing contiguous runs; the ctrl data
+       buffer caps us at kMaxStageEnts entries */
+    static const uint32_t kMaxStageEnts = kDataBufLen / sizeof(struct virtio_gpu_mem_entry);
+    struct virtio_gpu_mem_entry *ents =
+        (struct virtio_gpu_mem_entry *)IOMalloc(kMaxStageEnts * sizeof(*ents));
+    if (!ents) {
+        md->complete();
+        surf->release();
+        return kIOReturnNoResources;
+    }
+    uint32_t nsegs = 0;
+    uint64_t off = 0, bytes = 0;
+    while (off < total) {
+        IOByteCount segLen = 0;
+        IOPhysicalAddress pa = md->getPhysicalSegment(off, &segLen);
+        if (!pa || !segLen) break;
+        if (nsegs && ents[nsegs - 1].addr + ents[nsegs - 1].length == pa) {
+            ents[nsegs - 1].length += (uint32_t)segLen;
+        } else if (nsegs == kMaxStageEnts) {
+            LOG("stage_import surface %llu: too scattered (> %u runs)", (unsigned long long)si->surface_id, kMaxStageEnts);
+            IOFree(ents, kMaxStageEnts * sizeof(*ents));
+            md->complete();
+            surf->release();
+            return kIOReturnNoSpace;
+        } else {
+            ents[nsegs].addr = pa;
+            ents[nsegs].length = (uint32_t)segLen;
+            nsegs++;
+        }
+        off += segLen;
+        bytes += segLen;
+    }
+    if (off < total) {
+        LOG("stage_import surface %llu: segment walk stopped at %llu/%llu", (unsigned long long)si->surface_id, (unsigned long long)off, (unsigned long long)total);
+        IOFree(ents, kMaxStageEnts * sizeof(*ents));
+        md->complete();
+        surf->release();
+        return kIOReturnVMError;
+    }
+
+    int idx = -1;
+    for (uint32_t i = 1; i < kMaxBos; i++) if (!fBo[i].used) { idx = (int)i; break; }
+    if (idx < 0) {
+        IOFree(ents, kMaxStageEnts * sizeof(*ents));
+        md->complete();
+        surf->release();
+        return kIOReturnNoResources;
+    }
+    uapiBo *bo = &fBo[idx];
+    *bo = {};
+    bo->used = true;
+    bo->resId = fNextResId++;
+    bo->size = bytes;
+    bo->blobMem = VIRTGPU_BLOB_MEM_GUEST;
+    bo->blobFlags = VIRTGPU_BLOB_FLAG_USE_SHAREABLE;
+    bo->ctxId = fCtx[ctxIdx].ctxId;
+    bo->surfObj = surf;      /* keeps the IOSurface (and its md) alive */
+    bo->surfMem = md;
+    md->retain();            /* descriptor is the surface's borrowed one */
+
+    struct virtio_gpu_resource_create_blob cb = {};
+    struct virtio_gpu_ctrl_hdr resp = {};
+    cb.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    cb.hdr.ctx_id = bo->ctxId;
+    cb.resource_id = bo->resId;
+    cb.blob_mem = bo->blobMem;
+    cb.blob_flags = bo->blobFlags;
+    cb.size = bytes;
+    cb.nr_entries = nsegs;
+    if (!ctrlCmdData(&cb, sizeof(cb), ents, nsegs * sizeof(*ents), &resp, sizeof(resp)) ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        LOG("stage_import CREATE_BLOB res %u: resp %#x", bo->resId, resp.type);
+        md->release();
+        md->complete();
+        surf->release();
+        *bo = {};
+        return kIOReturnIOError;
+    }
+    bo->attached = true;     /* created with ctx_id: auto-attached host-side */
+    IOFree(ents, kMaxStageEnts * sizeof(*ents));
+
+    si->res_handle = bo->resId;
+    si->bo_handle = (uint32_t)idx;
+    si->size = (uint32_t)bytes;
+    *outSize = sizeof(*si);
+    return kIOReturnSuccess;
+}
+
 IOReturn VirtIOGPU::uapiGetCapsLocked(struct drm_virtgpu_get_caps *gc,
                                       uint32_t size, uint32_t *outSize,
                                       const void *staging, uint32_t stagingLen)
@@ -1784,7 +1946,7 @@ IOMemoryDescriptor *VirtIOGPU::uapiMemoryForType(uint32_t type)
 }
 
 IOReturn VirtIOGPU::uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t *outSize,
-                              const void *staging, uint32_t stagingLen, int *ctxIdx)
+                              const void *staging, uint32_t stagingLen, int *ctxIdx, task_t task)
 {
     /* DRM ioctl encoding: nr in bits 8-15, type ('d') in bits 0-7 */
     uint32_t nr = (cmd >> 8) & 0xff;
@@ -1845,6 +2007,9 @@ IOReturn VirtIOGPU::uapiIoctl(uint32_t cmd, void *data, uint32_t size, uint32_t 
         break;
     case UAPI_RESOURCE_CREATE_BLOB:
         r = uapiBlobCreateLocked((struct drm_virtgpu_resource_create_blob *)data, size, outSize, staging, stagingLen, *ctxIdx);
+        break;
+    case UAPI_STAGE_IMPORT:
+        r = uapiStageImportLocked((struct vmtl_stage_import *)data, size, outSize, task, *ctxIdx);
         break;
     case UAPI_EXECBUFFER:
         r = uapiExecbufLocked((struct drm_virtgpu_execbuffer *)data, size, staging, stagingLen, *ctxIdx);
@@ -2008,7 +2173,7 @@ IOReturn VirtIOGPUUserClient::sIoctl(OSObject *target, void *reference, IOExtern
     IOReturn r = uc->fOwner->uapiIoctl(cmd, (void *)(uintptr_t)args->structureInput,
                                        (uint32_t)args->structureInputSize, &outLen,
                                        uc->fStaging ? uc->fStaging->getBytesNoCopy() : nullptr,
-                                       uc->fStaging ? kStagingLen : 0, &uc->fCtxIdx);
+                                       uc->fStaging ? kStagingLen : 0, &uc->fCtxIdx, uc->fTask);
     if (r == kIOReturnSuccess) {
         if (outLen) {
             /* uapiIoctl mutates the input copy (getparam->value, map->offset,
