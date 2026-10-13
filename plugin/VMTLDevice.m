@@ -6,6 +6,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import "vmtl_compat13.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach.h>

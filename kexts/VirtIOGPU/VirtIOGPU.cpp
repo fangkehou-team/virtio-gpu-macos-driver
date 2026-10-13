@@ -599,7 +599,13 @@ private:
        dereferences the region itself; userspace maps it per-bo. */
     IOPhysicalAddress fShmPa = 0;
     uint64_t fShmLen = 0;
-    uint64_t fShmCursor = 0;    /* bump allocator; freed on bo close (rare) */
+    uint64_t fShmCursor = 0;    /* bump allocator past the hole list below */
+    /* freed shm ranges kept for reuse (sorted, coalesced; a range touching
+       fShmCursor shrinks it, so a fully idle region collapses to empty) */
+    struct shmHole { uint64_t off = 0, size = 0; };
+    static const uint32_t kMaxShmHoles = 300;
+    shmHole fShmHoles[kMaxShmHoles];
+    uint32_t fNumShmHoles = 0;
     /* second staging buffer: 3D command data / blob cmd payloads */
     IOBufferMemoryDescriptor *fDataBuf = nullptr;
     uint8_t *fDataV = nullptr;
@@ -655,6 +661,7 @@ private:
     IOReturn uapiTransferLocked(bool toHost, struct drm_virtgpu_3d_transfer_to_host *t, uint32_t size);
     bool uapiMapBlobLocked(uapiBo *bo);
     void uapiUnmapBlobLocked(uapiBo *bo);
+    void uapiShmFreeLocked(uint64_t off, uint64_t size);
     IOReturn uapiCloseHandleLocked(uint32_t handle);
     /* the work loop is created lazily by IOService; keep it mutable here */
     mutable IOWorkLoop *fWorkLoop = nullptr;
@@ -1367,16 +1374,24 @@ void VirtIOGPU::uapiCtxDestroyLocked(int idx)
     fCtx[idx] = {};
 }
 
-/* MAP_BLOB: place the host3d blob in the shared-memory region at a
-   guest-chosen offset (bump allocator) and record the physical address. */
+/* MAP_BLOB: place the host3d blob in the shared-memory region (first-fit
+   over freed ranges, else a bump allocator) and record the physical
+   address.  The range is committed only after the host accepts the map. */
 bool VirtIOGPU::uapiMapBlobLocked(uapiBo *bo)
 {
     if (!fHasHostVisible || !fShmPa || !bo || bo->mapped) return false;
     if (!(bo->blobFlags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE)) return false;
 
-    uint64_t off = (fShmCursor + 4095) & ~4095ull;
-    if (off + bo->size > fShmLen) { LOG("shm region exhausted (%llu used)", (unsigned long long)fShmCursor); return false; }
-    fShmCursor = off + bo->size;
+    int hole = -1;
+    for (uint32_t i = 0; i < fNumShmHoles; i++) {
+        if (fShmHoles[i].size >= bo->size) { hole = (int)i; break; }
+    }
+    uint64_t off = hole >= 0 ? fShmHoles[hole].off : (fShmCursor + 4095) & ~4095ull;
+    if (hole < 0 && off + bo->size > fShmLen) {
+        LOG("shm region exhausted (%llu used, %u holes)",
+            (unsigned long long)fShmCursor, fNumShmHoles);
+        return false;
+    }
 
     struct virtio_gpu_resource_map_blob req = {};
     struct virtio_gpu_resp_map_info resp = {};
@@ -1388,6 +1403,19 @@ bool VirtIOGPU::uapiMapBlobLocked(uapiBo *bo)
         LOG("MAP_BLOB res %u: resp %#x", bo->resId, resp.hdr.type);
         return false;
     }
+
+    if (hole >= 0) {
+        fShmHoles[hole].off += bo->size;
+        fShmHoles[hole].size -= bo->size;
+        if (!fShmHoles[hole].size) {
+            memmove(&fShmHoles[hole], &fShmHoles[hole + 1],
+                    (fNumShmHoles - hole - 1) * sizeof(shmHole));
+            fNumShmHoles--;
+        }
+    } else {
+        fShmCursor = off + bo->size;
+    }
+
     bo->mapped = true;
     bo->shmOff = off;
     bo->shmPa = (IOPhysicalAddress)((uintptr_t)fShmPa + off);
@@ -1408,11 +1436,54 @@ void VirtIOGPU::uapiUnmapBlobLocked(uapiBo *bo)
     bo->mapped = false;
 }
 
+/* return a mapped range to the hole list: insert sorted, coalesce with
+   neighbours, and hand any range at the bump region's end back to
+   fShmCursor so a fully idle region collapses to empty */
+void VirtIOGPU::uapiShmFreeLocked(uint64_t off, uint64_t size)
+{
+    if (!size || off + size > fShmLen) return;
+
+    uint32_t i = 0;
+    while (i < fNumShmHoles && fShmHoles[i].off < off) i++;
+
+    if (fNumShmHoles == kMaxShmHoles) {
+        LOG("shm hole table full: leaking range at %llu", (unsigned long long)off);
+        return;   /* this range falls back to the old bump behaviour */
+    }
+    memmove(&fShmHoles[i + 1], &fShmHoles[i], (fNumShmHoles - i) * sizeof(shmHole));
+    fShmHoles[i].off = off;
+    fShmHoles[i].size = size;
+    fNumShmHoles++;
+
+    if (i + 1 < fNumShmHoles &&
+        fShmHoles[i].off + fShmHoles[i].size == fShmHoles[i + 1].off) {
+        fShmHoles[i].size += fShmHoles[i + 1].size;
+        memmove(&fShmHoles[i + 1], &fShmHoles[i + 2],
+                (fNumShmHoles - i - 2) * sizeof(shmHole));
+        fNumShmHoles--;
+    }
+    if (i > 0 && fShmHoles[i - 1].off + fShmHoles[i - 1].size == fShmHoles[i].off) {
+        fShmHoles[i - 1].size += fShmHoles[i].size;
+        memmove(&fShmHoles[i], &fShmHoles[i + 1],
+                (fNumShmHoles - i - 1) * sizeof(shmHole));
+        fNumShmHoles--;
+    }
+
+    while (fNumShmHoles > 0) {
+        shmHole *last = &fShmHoles[fNumShmHoles - 1];
+        if (last->off + last->size != fShmCursor) break;
+        fShmCursor = last->off;
+        fNumShmHoles--;
+    }
+}
+
 IOReturn VirtIOGPU::uapiCloseHandleLocked(uint32_t handle)
 {
     int idx = boLookup(handle);
     if (idx < 0) return kIOReturnBadArgument;
     uapiBo *bo = &fBo[idx];
+    const bool wasMapped = bo->mapped;
+    const uint64_t shmOff = bo->shmOff, shmSize = bo->size;
     uapiUnmapBlobLocked(bo);
     struct { struct virtio_gpu_ctrl_hdr hdr; uint32_t resource_id; uint32_t padding; } unref = {};
     struct virtio_gpu_ctrl_hdr resp = {};
@@ -1420,7 +1491,8 @@ IOReturn VirtIOGPU::uapiCloseHandleLocked(uint32_t handle)
     unref.resource_id = bo->resId;
     ctrlCmdData(&unref, sizeof(unref), nullptr, 0, &resp, sizeof(resp));
     if (bo->guestMem) { bo->guestMem->complete(); bo->guestMem->release(); bo->guestMem = nullptr; }
-    *bo = {};   /* shm offsets are leaked (bump allocator); 4G is plenty */
+    if (wasMapped) uapiShmFreeLocked(shmOff, shmSize);
+    *bo = {};
     return kIOReturnSuccess;
 }
 

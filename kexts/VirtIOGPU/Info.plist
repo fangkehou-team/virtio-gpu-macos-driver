@@ -19,6 +19,10 @@
 		<key>com.apple.kpi.bsd</key><string>8.0</string>
 		<key>com.apple.iokit.IOPCIFamily</key><string>1.0.0b1</string>
 		<key>com.apple.iokit.IOGraphicsFamily</key><string>1.0.0</string>
+		<!-- needed by the VIOAccelProbe class (ABI gate for the VirtIOAccel
+		     personality): it reads IOAccelerator/IOGraphicsAccelerator2
+		     metaclass sizes via their OSMetaClass symbols -->
+		<key>com.apple.iokit.IOAcceleratorFamily2</key><string>2.0.0</string>
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>
@@ -57,6 +61,41 @@
 			     "IOFramebuffer". start() re-resets the device anyway. -->
 			<key>IOMatchCategory</key>
 			<string>VirtIOGPU</string>
+		</dict>
+		<key>VirtIOAccel</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>io.vmtl.VirtIOGPU</string>
+			<key>IOClass</key><string>VirtIOAccel</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<!-- The accelerator nub that publishes this kext to Metal (P3).
+			     Same PCI match as VirtIOGPU but the IOAccelerator category, so
+			     it attaches ALONGSIDE the main driver on the same nub - exactly
+			     how NVAccel coexists with NVRM.kext. Metal reads
+			     MetalPluginName/MetalPluginClassName off this service and
+			     instantiates VMTLDevice (MTLIOAccelDevice) from the plugin
+			     bundle at /Library/GPUBundles/VMTLDriver. Gated at start() by
+			     the vioaccel=1 boot-arg so a bad bring-up can never boot-loop. -->
+			<key>IOPCIPrimaryMatch</key><string>0x00001af4&amp;0x0000ffff</string>
+			<key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+			<key>IOMatchCategory</key><string>IOAccelerator</string>
+			<key>IOProbeScore</key><integer>100</integer>
+			<key>MetalPluginName</key><string>../../../Library/GPUBundles/VMTLDriver</string>
+			<key>MetalPluginClassName</key><string>VMTLDevice</string>
+		</dict>
+		<key>VIOAccelProbe</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>io.vmtl.VirtIOGPU</string>
+			<key>IOClass</key><string>VIOAccelProbe</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<!-- ABI gate, shipped inside the already-approved VirtIOGPU bundle:
+			     same PCI match as VirtIOGPU but its own IOMatchCategory and a
+			     score far below, so probe() logs the live
+			     IOAccelerator/IOGraphicsAccelerator2 instance sizes and returns
+			     NULL without ever claiming the device. -->
+			<key>IOPCIPrimaryMatch</key><string>0x00001af4&amp;0x0000ffff</string>
+			<key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+			<key>IOMatchCategory</key><string>VIOAccelProbe</string>
+			<key>IOProbeScore</key><integer>10</integer>
 		</dict>
 		<key>VirtIOFB</key>
 		<dict>
