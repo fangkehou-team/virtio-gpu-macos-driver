@@ -55,6 +55,9 @@ Metal app(mtlprobe)
 - 修复 1 后:30/30 全绿(此前 ~85%)。
 - 修复 2 后:50/50 + 100 连跑全绿,`dmesg` 零 "shm region exhausted"。
 - 服务端对象表 MISSING 诊断在修复后窗口零命中。
+- 去除全部插桩的干净 render server 重启后(v62):29+40+60 = 129 全绿;
+  唯一一次失败发生在开机后第 1 分钟内(冷启动 WindowServer 抖动),
+  稳态 100 连续全绿。
 
 ## P3 验收对照(PLAN.md)
 
