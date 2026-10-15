@@ -298,9 +298,12 @@ static bool vmtl_process_is_allowed(void)
     if (!me) return false;
     // A headless NVIDIA GPU (the display is on the Intel or AMD GPU) is a Metal device for apps only: WindowServer stays
     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
-    // WindowServer before its "!WindowServer" line is reached.
+    // WindowServer before its "!WindowServer" line is reached. On this virtio deployment the display IS VirtIOFB, but
+    // WindowServer's compositing still needs a device to show app windows (P4.2(e)); dropping the marker file below
+    // hands it ours (its output lands in the FB scanout as in the P1 path). Remove the file to restore the deny.
     { int hv = 0; size_t hn = sizeof hv;
-      if (!strcmp(me, "WindowServer") && sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv) {
+      if (!strcmp(me, "WindowServer") && sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv
+          && access("/Library/GPUBundles/vmtl-windowserver", F_OK) != 0) {
           nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
     if (getenv("VMTL_ENABLE")) return true;
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "vmtltest") || !strcmp(me, "vmtlrender")) return true;
