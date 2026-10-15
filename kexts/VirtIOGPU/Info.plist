@@ -10,7 +10,7 @@
 	<key>CFBundlePackageType</key><string>KEXT</string>
 	<key>CFBundleShortVersionString</key><string>0.1</string>
 	<key>CFBundleVersion</key><string>0.1</string>
-	<key>IOUserClientClass</key><string>VirtIOGPUUserClient</string>
+	<key>IOUserClientClass</key><string>IOAccelVirtIOGPUUserClient</string>
 	<key>OSBundleLibraries</key>
 	<dict>
 		<key>com.apple.kpi.iokit</key><string>8.0</string>
@@ -34,7 +34,7 @@
 			<key>CFBundleIdentifier</key><string>io.vmtl.VirtIOGPU</string>
 			<key>IOClass</key><string>VirtIOGPU</string>
 			<key>IOProviderClass</key><string>IOPCIDevice</string>
-			<key>IOUserClientClass</key><string>VirtIOGPUUserClient</string>
+			<key>IOUserClientClass</key><string>IOAccelVirtIOGPUUserClient</string>
 			<!-- virtio-gpu modern PCI device. IOPCIPrimaryMatch compares the 32-bit
 			     (device<<16 | vendor) word (same encoding NVRM uses for 0x10de), so
 			     0x00001af4&0x0000ffff reads as "vendor 0x1af4 (Red Hat/virtio), any

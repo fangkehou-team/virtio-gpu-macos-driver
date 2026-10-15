@@ -551,11 +551,11 @@ struct vq {
      makes it the one framebuffer candidate on this controller, and a score
      above IONDRVFramebuffer's keeps it in front of the firmware console. */
 class VirtIOGPU;
-class VirtIOGPUUserClient;
+class IOAccelVirtIOGPUUserClient;
 
 class VirtIOGPU : public IOService {
     OSDeclareDefaultStructors(VirtIOGPU)
-    friend class VirtIOGPUUserClient;
+    friend class IOAccelVirtIOGPUUserClient;
 public:
     virtual IOService *probe(IOService *provider, SInt32 *score) override;
     virtual bool start(IOService *provider) override;
@@ -2093,8 +2093,8 @@ void VirtIOGPU::uapiClientClosed(int *ctxIdx)
 /* ---- user client: the Linux-uapi-shaped surface ---- */
 enum { SEL_IOCTL = 0, SEL_WAITEVENT = 1 };
 
-class VirtIOGPUUserClient : public IOUserClient {
-    OSDeclareDefaultStructors(VirtIOGPUUserClient)
+class IOAccelVirtIOGPUUserClient : public IOUserClient {
+    OSDeclareDefaultStructors(IOAccelVirtIOGPUUserClient)
 public:
     bool initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties) override;
     bool start(IOService *provider) override;
@@ -2119,16 +2119,16 @@ private:
 
 #undef super
 #define super IOUserClient
-OSDefineMetaClassAndStructors(VirtIOGPUUserClient, IOUserClient)
+OSDefineMetaClassAndStructors(IOAccelVirtIOGPUUserClient, IOUserClient)
 
-bool VirtIOGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties)
+bool IOAccelVirtIOGPUUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties)
 {
     if (!super::initWithTask(owningTask, securityID, type, properties)) return false;
     fTask = owningTask;
     return true;
 }
 
-bool VirtIOGPUUserClient::start(IOService *provider)
+bool IOAccelVirtIOGPUUserClient::start(IOService *provider)
 {
     fOwner = OSDynamicCast(VirtIOGPU, provider);
     if (!fOwner) return false;
@@ -2138,7 +2138,7 @@ bool VirtIOGPUUserClient::start(IOService *provider)
     return super::start(provider);
 }
 
-IOReturn VirtIOGPUUserClient::clientClose(void)
+IOReturn IOAccelVirtIOGPUUserClient::clientClose(void)
 {
     if (fStaging) { fStaging->complete(); fStaging->release(); fStaging = nullptr; }
     /* runs on graceful close and on process death (SIGSEGV included):
@@ -2149,7 +2149,7 @@ IOReturn VirtIOGPUUserClient::clientClose(void)
     return kIOReturnSuccess;
 }
 
-IOReturn VirtIOGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+IOReturn IOAccelVirtIOGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                              IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
 {
     static const IOExternalMethodDispatch tbl[] = {
@@ -2161,10 +2161,10 @@ IOReturn VirtIOGPUUserClient::externalMethod(uint32_t selector, IOExternalMethod
     return super::externalMethod(selector, args, &d, this, reference);
 }
 
-IOReturn VirtIOGPUUserClient::sIoctl(OSObject *target, void *reference, IOExternalMethodArguments *args)
+IOReturn IOAccelVirtIOGPUUserClient::sIoctl(OSObject *target, void *reference, IOExternalMethodArguments *args)
 {
     (void)reference;
-    VirtIOGPUUserClient *uc = OSDynamicCast(VirtIOGPUUserClient, target);
+    IOAccelVirtIOGPUUserClient *uc = OSDynamicCast(IOAccelVirtIOGPUUserClient, target);
     if (!uc || !uc->fOwner || args->structureInputSize > 4096) return kIOReturnBadArgument;
     uint32_t cmd = (uint32_t)args->scalarInput[0];
     uint32_t outLen = 0;
@@ -2190,7 +2190,7 @@ IOReturn VirtIOGPUUserClient::sIoctl(OSObject *target, void *reference, IOExtern
     return r;
 }
 
-IOReturn VirtIOGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
+IOReturn IOAccelVirtIOGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
     (void)options;
     if (!memory) return kIOReturnBadArgument;
@@ -2207,10 +2207,10 @@ IOReturn VirtIOGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *opt
     return kIOReturnSuccess;
 }
 
-IOReturn VirtIOGPUUserClient::sWaitEvent(OSObject *target, void *reference, IOExternalMethodArguments *args)
+IOReturn IOAccelVirtIOGPUUserClient::sWaitEvent(OSObject *target, void *reference, IOExternalMethodArguments *args)
 {
     (void)reference;
-    VirtIOGPUUserClient *uc = OSDynamicCast(VirtIOGPUUserClient, target);
+    IOAccelVirtIOGPUUserClient *uc = OSDynamicCast(IOAccelVirtIOGPUUserClient, target);
     if (!uc || !uc->fOwner) return kIOReturnBadArgument;
     uint32_t signaled = 0;
     IOReturn r = uc->fOwner->uapiWaitEvent((uint32_t)args->scalarInput[0], (uint32_t)args->scalarInput[1], &signaled);
