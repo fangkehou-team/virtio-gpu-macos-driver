@@ -395,6 +395,15 @@ impl Emitter {
                 }
             });
         let Some(stored) = stored else {
+            if self.emit_static_sampler_struct_field(
+                result_name,
+                result,
+                result_ty,
+                key,
+                instructions,
+            )? {
+                return Ok(());
+            }
             self.emit_unmodeled_byte_pointer_copy(result_name, result, *addrspace, instructions)?;
             self.emit_sidecar.local_pointer_field_loads.push(
                 crate::emit_sidecar::LocalPointerFieldLoad {
@@ -1594,10 +1603,84 @@ impl Emitter {
         if indices.len() > 1 && indices.first() == Some(&0) {
             indices.remove(0);
         }
+        // A member/element index of 0 selects the sub-object at byte offset 0,
+        // so an all-zero access path denotes the same storage location as the
+        // field's own slot. AIR wraps a runtime sampler pointer in the
+        // single-field `%"struct.metal::sampler"` (`{ %struct._sampler_t
+        // addrspace(2)* }`) and loads the member back out through
+        // `getelementptr ... i64 0, i32 0`; without normalizing the path the
+        // recovering load's key would gain a spurious `0` and stop matching the
+        // store's `[]` key, so the sampler state would be reported as
+        // unrecovered. Collapsing the all-zero path restores the match without
+        // changing any non-zero field path.
+        if indices.iter().all(|index| *index == 0) {
+            indices.clear();
+        }
         Ok(Some(LocalPointerField {
             root: provenance.root,
             indices,
         }))
+    }
+
+    /// AIR keeps constant `%"struct.metal::sampler"` globals such as
+    /// `@_ZL14unused_sampler = constant %"struct.metal::sampler" { ptr @__air_sampler_state }`,
+    /// and the fallback-sampler idiom loads the inner sampler pointer out of
+    /// one after a select collapsed to that arm. SPIR-V cannot materialise
+    /// pointer-to-global constants, so the global is emitted with a null
+    /// initializer and the field load has no stored value to forward. Recover
+    /// the static sampler state from the AIR initializer instead: emitting an
+    /// `OpBitcast` of the sampler-state global lets `handle_static_sampler`
+    /// rewrite it into a sampler-typed load with the exact state, exactly like
+    /// a direct `@__air_sampler_state` sample operand.
+    fn emit_static_sampler_struct_field(
+        &mut self,
+        result_name: &str,
+        result: Word,
+        result_ty: &LlType,
+        key: &LocalPointerField,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !matches!(result_ty, LlType::Ptr(2)) {
+            return Ok(false);
+        }
+        let Some(sampler_name) = self.static_sampler_field_global_name(key) else {
+            return Ok(false);
+        };
+        let Some((sampler_var, _)) = self.global_values.get(&sampler_name).cloned() else {
+            return Ok(false);
+        };
+        let result_type = self.ptr_type_id(StorageClass::Private, &LlType::Int(64))?;
+        instructions.push(Self::inst(
+            Op::Bitcast,
+            Some(result_type),
+            Some(result),
+            vec![Operand::IdRef(sampler_var)],
+        ));
+        self.pointer_storage
+            .insert(result_name.to_string(), StorageClass::Private);
+        Ok(true)
+    }
+
+    fn static_sampler_field_global_name(&self, key: &LocalPointerField) -> Option<String> {
+        let global = self.ir.globals.iter().find(|global| {
+            self.global_values
+                .get(&global.name)
+                .is_some_and(|(id, _)| *id == key.root)
+        })?;
+        let initializer = global.initializer.as_ref()?;
+        let LlValue::Struct(fields) = &initializer.value else {
+            return None;
+        };
+        let field_index = match key.indices.as_slice() {
+            [] if fields.len() == 1 => 0,
+            [index] => *index as usize,
+            _ => return None,
+        };
+        let field = fields.get(field_index)?;
+        let LlValue::Global(sampler_name) = &field.value else {
+            return None;
+        };
+        crate::meta::is_static_sampler_global(sampler_name).then(|| sampler_name.clone())
     }
 
     pub(in crate::native::emitter) fn local_pointer_dynamic_field_index(

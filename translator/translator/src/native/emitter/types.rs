@@ -876,9 +876,32 @@ impl Emitter {
         if let Some(id) = self.const_scalar_or_composite_id(value, ty)? {
             return Ok(id);
         }
+        // AIR keeps a "fallback sampler" global: a struct of pointers to the
+        // opaque sampler-state constants, e.g. @_ZL14unused_sampler =
+        //   constant %"struct.metal::sampler" { ptr @__air_sampler_state }
+        // SPIR-V has no pointer-to-global constants, so the struct cannot be
+        // materialised as Op::ConstantComposite. The sampler itself reaches
+        // the pipeline through VMTL's sampler-binding machinery (the
+        // air.sample_* lowering reads !air.sampler_states), so an all-pointer
+        // struct initializer is emitted as a null of the same type.
+        if self.sampler_fallback_initializer(value, ty) {
+            return self.const_null(ty);
+        }
         Err(format!(
             "native emitter: unsupported global initializer {value:?} for {ty:?}"
         ))
+    }
+
+    fn sampler_fallback_initializer(&self, value: &LlValue, ty: &LlType) -> bool {
+        let Ok(ty) = self.resolve_type(ty) else { return false };
+        let LlType::Struct(fields) = ty else { return false };
+        let LlValue::Struct(values) = value else { return false };
+        values.len() == fields.len()
+            && !values.is_empty()
+            && values
+                .iter()
+                .zip(fields)
+                .all(|(v, f)| matches!(f, LlType::Ptr(2)) && matches!(v.value, LlValue::Global(_)))
     }
 
     pub(super) fn const_scalar_id(
