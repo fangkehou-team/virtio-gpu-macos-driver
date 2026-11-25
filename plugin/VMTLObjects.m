@@ -7,6 +7,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <unistd.h>
 
 void nvlog(const char *fmt, ...);
 
@@ -575,6 +576,95 @@ static void vmtl_purge_report(const char *why) {
           (unsigned long long)atomic_load(&gPurgeAsks), (unsigned long long)(bemp >> 20));
 }
 static void vmtl_pre_release(void *held) { @autoreleasepool { (void)CFBridgingRelease(held); } }
+static void vmtl_presubmit_large(const char *kind, VMTLBuffer *b, NSUInteger lo, NSUInteger n) {
+    if (n < 131072) return;
+    static _Atomic unsigned said;
+    const unsigned k = atomic_fetch_add(&said, 1);
+    if (k < 16 || ((k + 1) & 0xFFF) == 0)
+        nvlog("presubmit-large: %s buf %p size %zu range %lu..%lu (%lu bytes)",
+              kind, b, b->_b.size, (unsigned long)lo, (unsigned long)(lo + n), (unsigned long)n);
+}
+#define VMTL_MRB_SLOTS 8
+#define VMTL_MRB_OFF 288
+#define VMTL_MRB_END 2512
+#define VMTL_MRB_LEN 48
+#define VMTL_MRB_SPAN (VMTL_MRB_END - VMTL_MRB_OFF)
+static const NSUInteger vmtl_mrb_offsets[] = { 288, 2144, 2464 };
+static struct {
+    VMTLBuffer *b;
+    uint64_t gpu, seq;
+    unsigned char bytes[VMTL_MRB_SPAN];
+    int valid;
+} vmtl_mrb[VMTL_MRB_SLOTS];
+static os_unfair_lock vmtl_mrb_lock = OS_UNFAIR_LOCK_INIT;
+static int vmtl_mrb_on(void) {
+    static uint64_t next; static int on;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (now < next) return on;
+    next = now + 250000000ull;
+    const int want = access("/tmp/vmtl-trace-managed-readback", F_OK) == 0;
+    if (want != on) {
+        on = want;
+        os_unfair_lock_lock(&vmtl_mrb_lock);
+        for (unsigned k = 0; k < VMTL_MRB_SLOTS; k++) vmtl_mrb[k].valid = 0;
+        os_unfair_lock_unlock(&vmtl_mrb_lock);
+    }
+    return on;
+}
+static void vmtl_mrb_forget(VMTLBuffer *b) {
+    os_unfair_lock_lock(&vmtl_mrb_lock);
+    for (unsigned k = 0; k < VMTL_MRB_SLOTS; k++)
+        if (vmtl_mrb[k].b == b) { vmtl_mrb[k].valid = 0; vmtl_mrb[k].b = NULL; }
+    os_unfair_lock_unlock(&vmtl_mrb_lock);
+}
+static void vmtl_mrb_floats(const char *what, VMTLBuffer *b, NSUInteger off, uint64_t seq, const void *map) {
+    const float *f = map;
+    nvtrace("%s buf %p off %lu seq %llu: %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g",
+            what, b, (unsigned long)off, (unsigned long long)seq,
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+}
+static void vmtl_mrb_snapshot(VMTLBuffer *b, NSUInteger lo, NSUInteger n) {
+    if (!vmtl_mrb_on() || b->_b.size != 262144 || !b->_shadow.map ||
+        lo > VMTL_MRB_OFF || n < VMTL_MRB_END - lo) return;
+    unsigned char expected[VMTL_MRB_SPAN];
+    uint64_t seq = 0; int previous = 0;
+    os_unfair_lock_lock(&vmtl_mrb_lock);
+    unsigned k = 0;
+    for (; k < VMTL_MRB_SLOTS; k++) if (vmtl_mrb[k].b == b) break;
+    if (k == VMTL_MRB_SLOTS) {
+        for (k = 0; k < VMTL_MRB_SLOTS; k++) if (!vmtl_mrb[k].valid) break;
+        if (k == VMTL_MRB_SLOTS) k = 0;
+        vmtl_mrb[k].b = b; vmtl_mrb[k].seq = 0;
+    }
+    if (vmtl_mrb[k].valid) {
+        memcpy(expected, vmtl_mrb[k].bytes, sizeof expected);
+        seq = vmtl_mrb[k].seq; previous = 1;
+    }
+    memcpy(vmtl_mrb[k].bytes, (const unsigned char *)b->_shadow.map + VMTL_MRB_OFF, VMTL_MRB_SPAN);
+    vmtl_mrb[k].gpu = vmtl_vk_buffer_address(&b->_b);
+    vmtl_mrb[k].valid = 1; vmtl_mrb[k].seq++;
+    os_unfair_lock_unlock(&vmtl_mrb_lock);
+    if (!previous) return;
+    extern nvk_queue *vmtl_device_queue(void);
+    nvk_buffer rb;
+    if (vmtl_vk_buffer_create(VMTL_MRB_SPAN, 1, &rb) || !rb.map) {
+        nvtrace("MRB buf %p seq %llu READBACK CREATE FAILED", b, (unsigned long long)seq);
+        return;
+    }
+    const int rc = vmtl_vk_copy_buffer(vmtl_device_queue(), &b->_b, VMTL_MRB_OFF, &rb, 0, VMTL_MRB_SPAN);
+    for (unsigned j = 0; j < sizeof vmtl_mrb_offsets / sizeof vmtl_mrb_offsets[0]; j++) {
+        const NSUInteger off = vmtl_mrb_offsets[j], rel = off - VMTL_MRB_OFF;
+        const int different = rc ? -1 : memcmp(expected + rel, (const unsigned char *)rb.map + rel, VMTL_MRB_LEN) != 0;
+        nvtrace("MRB buf %p gpu 0x%llx off %lu seq %llu rc %d different %d",
+                b, (unsigned long long)vmtl_vk_buffer_address(&b->_b), (unsigned long)off,
+                (unsigned long long)seq, rc, different);
+        if (!rc) {
+            vmtl_mrb_floats("MRB-CPU", b, off, seq, expected + rel);
+            vmtl_mrb_floats("MRB-GPU", b, off, seq, (const unsigned char *)rb.map + rel);
+        }
+    }
+    vmtl_vk_buffer_destroy(&rb);
+}
 static void vmtl_managed_flush(void) {
     if (!atomic_load(&gManagedAny) || gManagedInFlush) return;
     gManagedInFlush = 1;
@@ -589,14 +679,26 @@ static void vmtl_managed_flush(void) {
     if (todo.count && vmtl_vk_pre_open()) {
         for (NSArray *t in todo) {
             VMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
+            vmtl_mrb_snapshot(b, lo, n);
+            if (b->_b.size == 262144 && vmtl_trace_on())
+                nvtrace("MUP buf %p gpu 0x%llx range %lu+%lu shadow %p z %d",
+                        b, (unsigned long long)vmtl_vk_buffer_address(&b->_b),
+                        (unsigned long)lo, (unsigned long)n, b->_shadow.map, b->_zshadow);
             if (vmtl_vk_pre_copy(&b->_shadow, lo, &b->_b, lo, n))
                 nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)n, (unsigned long)lo);
+            else
+                vmtl_presubmit_large("managed-copy", b, lo, n);
         }
         vmtl_pre_release_hook = vmtl_pre_release;
         vmtl_vk_pre_hold((__bridge_retained void *)todo);
     } else
     for (NSArray *t in todo) {
         VMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
+        vmtl_mrb_snapshot(b, lo, n);
+        if (b->_b.size == 262144 && vmtl_trace_on())
+            nvtrace("MUP-FALLBACK buf %p gpu 0x%llx range %lu+%lu shadow %p z %d",
+                    b, (unsigned long long)vmtl_vk_buffer_address(&b->_b),
+                    (unsigned long)lo, (unsigned long)n, b->_shadow.map, b->_zshadow);
         if (vmtl_vk_copy_buffer(vmtl_device_queue(), &b->_shadow, lo, &b->_b, lo, n))
             nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)n, (unsigned long)lo);
     }
@@ -638,7 +740,10 @@ static void vmtl_zero_flush(void) {
     nvk_cmdbuf c; unsigned n = 0; size_t bytes = 0;
     if (todo.count && vmtl_vk_pre_open()) {
         for (VMTLBuffer *b in todo) { const size_t w = b->_b.size & ~(size_t)3;
-            if (b->_b.buf && w && vmtl_vk_pre_fill(&b->_b, 0, w, 0) == 0) { n++; bytes += w; gZeroTail += b->_b.size - w; } }
+            if (b->_b.buf && w && vmtl_vk_pre_fill(&b->_b, 0, w, 0) == 0) {
+                n++; bytes += w; gZeroTail += b->_b.size - w;
+                vmtl_presubmit_large("zero-fill", b, 0, w);
+            } }
         vmtl_pre_release_hook = vmtl_pre_release;
         vmtl_vk_pre_hold((__bridge_retained void *)todo);
         const unsigned long long k = atomic_fetch_add(&gZeroGpuN, n); gZeroGpuB += bytes;
@@ -749,9 +854,20 @@ static VMTLTexture *vmtl_texbuf_make(VMTLBuffer *b, MTLTextureDescriptor *d, NSU
         return nil; }
     MTLTextureDescriptor *cd = [d copy]; cd.storageMode = MTLStorageModeShared;
     id<MTLTexture> c = [[self device] newTextureWithDescriptor:cd];
-    if (c) [c replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(char *)base + offset bytesPerRow:bpr];
-    { static int said; if (!said++) nvlog("newTiledTextureWithDescriptor: linear view refused -> copied texture (%lux%lu bpr %lu; said once)",
-                                          (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr); }
+    if (c) {
+        [c replaceRegion:MTLRegionMake2D(0, 0, d.width, d.height) mipmapLevel:0 withBytes:(char *)base + offset bytesPerRow:bpr];
+        VMTLTexture *copy = (VMTLTexture *)c;
+        copy->_backBuf = self;
+        copy->_backOff = offset;
+        copy->_backBPR = bpr;
+        copy->_tiledCopy = YES;
+        /* SkyLight's tiled backing is a CPU -> GPU source.  Its no-copy pages
+           may be read-only shared memory, so publication must not copy the
+           sampling snapshot back into the caller's pages. */
+        self->_hostSyncInOnly = YES;
+        static int said; if (!said++) nvlog("newTiledTextureWithDescriptor: linear view refused -> copied texture synchronized from its source buffer (%lux%lu bpr %lu; said once)",
+                                              (unsigned long)d.width, (unsigned long)d.height, (unsigned long)bpr);
+    }
     return c;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bpr {
@@ -829,6 +945,7 @@ static VMTLTexture *vmtl_texbuf_make(VMTLBuffer *b, MTLTextureDescriptor *d, NSU
 - (void)removeAllDebugMarkers {}
 void vmtl_vk_buffer_retire(nvk_buffer *b);
 - (void)dealloc {
+    vmtl_mrb_forget(self);
     if (_b.buf && vmtl_trace_on()) nvtrace("BUFFREE 0x%llx len %zu", (unsigned long long)vmtl_vk_buffer_address(&_b), _b.size);
     for (uint32_t k = 0; k < _nbpk; k++) vmtl_vk_image_destroy(&_bpk[k].img);
     free(_bpk); _bpk = NULL; _nbpk = 0;
@@ -848,7 +965,13 @@ void vmtl_vk_buffer_retire(nvk_buffer *b);
     if (_shadow.map) {
         if (r.location >= _b.size) return;
         NSUInteger n = MIN(r.length, _b.size - r.location);
-        if (n) vmtl_managed_mark(self, r.location, r.location + n);
+        if (n) {
+            if (_b.size == 262144 && vmtl_trace_on())
+                nvtrace("MOD buf %p gpu 0x%llx range %lu+%lu shadow %p z %d",
+                        self, (unsigned long long)vmtl_vk_buffer_address(&_b),
+                        (unsigned long)r.location, (unsigned long)n, _shadow.map, _zshadow);
+            vmtl_managed_mark(self, r.location, r.location + n);
+        }
         return;
     }
     vmtl_buffer_sync_in(self); }
@@ -868,13 +991,16 @@ static void vmtl_surf_dirty(VMTLCommandBuffer *cb, VMTLTexture *t) {
 }
 static int g_trace_lines;
 static int g_trace_bigonly, g_trace_mute;
+static int vmtl_boot_diag(void) { return access("/var/tmp/vmtl-boot-capture", F_OK) == 0; }
+static int vmtl_firstpass_diag(void) { return access("/var/tmp/vmtl-firstpass-capture", F_OK) == 0; }
+static int vmtl_icon_trace_diag(void) { return access("/var/tmp/vmtl-icon-trace", F_OK) == 0; }
 static int vmtl_trace_on(void) {
     static uint64_t next; static int on;
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     static int cap = 2500;
-    if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/vmtl-trace-request", F_OK) == 0;
-        g_trace_bigonly = on && access("/tmp/vmtl-trace-big", F_OK) == 0; if (!g_trace_bigonly) g_trace_mute = 0;
-        if (on && !was) { g_trace_lines = 0; cap = access("/tmp/vmtl-trace-long", F_OK) == 0 ? 20000 : 2500; } }
+    if (now >= next) { next = now + 250000000ull; int was = on; on = access("/tmp/vmtl-trace-request", F_OK) == 0 || vmtl_boot_diag() || vmtl_firstpass_diag();
+        g_trace_bigonly = on && (access("/tmp/vmtl-trace-big", F_OK) == 0 || vmtl_boot_diag() || vmtl_firstpass_diag()); if (!g_trace_bigonly) g_trace_mute = 0;
+        if (on && !was) { g_trace_lines = 0; cap = (access("/tmp/vmtl-trace-long", F_OK) == 0 || vmtl_boot_diag() || vmtl_firstpass_diag()) ? 20000 : 2500; } }
     return on && !g_trace_mute && g_trace_lines < cap;
 }
 static int nvtrace_scope(uint32_t w, uint32_t h) { int was = g_trace_mute; g_trace_mute = 0; (void)vmtl_trace_on();
@@ -885,9 +1011,10 @@ static void nvtrace(const char *fmt, ...) {
     char p[96]; snprintf(p, sizeof p, "/tmp/vmtl-trace-%d.txt", (int)getpid());
     int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0) { static int said; if (!said++) nvlog("G15 trace: cannot open %s (errno %d)", p, errno); return; }
-    char b[700]; va_list a; va_start(a, fmt); int n = vsnprintf(b, sizeof b - 1, fmt, a); va_end(a);
-    if (n < 0) n = 0; if (n > (int)sizeof b - 2) n = (int)sizeof b - 2;
-    b[n++] = '\n'; if (write(fd, b, (size_t)n) != n) { static int said2; if (!said2++) nvlog("G15 trace: short write (errno %d)", errno); }
+    char b[700]; int prefix = snprintf(b, 24, "T%llx ", (unsigned long long)(uintptr_t)pthread_self());
+    va_list a; va_start(a, fmt); int body = vsnprintf(b + prefix, sizeof b - (size_t)prefix - 1, fmt, a); va_end(a);
+    if (body < 0) body = 0; if (body > (int)sizeof b - prefix - 2) body = (int)sizeof b - prefix - 2;
+    int n = prefix + body; b[n++] = '\n'; if (write(fd, b, (size_t)n) != n) { static int said2; if (!said2++) nvlog("G15 trace: short write (errno %d)", errno); }
     close(fd); g_trace_lines++;
 }
 static void nvtrace_floats(const char *what, unsigned long idx, unsigned long off, const void *map, int nf) {
@@ -923,11 +1050,22 @@ static void vmtl_surface_cpu_dump(VMTLTexture *rt) {
     static uint64_t next; static int on;
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     if (now >= next) { next = now + 250000000ull; on = access("/tmp/vmtl-dump-request", F_OK) == 0; }
-    if (!on || !rt || !rt->_surf || IOSurfaceGetBytesPerElement(rt->_surf) != 4 || IOSurfaceGetPlaneCount(rt->_surf) > 1) return;
-    if (IOSurfaceLock(rt->_surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) { static int said; if (!said++) nvlog("G16 cpu dump: IOSurfaceLock failed"); return; }
-    char tag[24]; snprintf(tag, sizeof tag, "cpu%u-", (unsigned)IOSurfaceGetID(rt->_surf));
-    vmtl_frame_dump(tag, IOSurfaceGetBaseAddress(rt->_surf), IOSurfaceGetBytesPerRow(rt->_surf), (uint32_t)IOSurfaceGetWidth(rt->_surf), (uint32_t)IOSurfaceGetHeight(rt->_surf));
-    IOSurfaceUnlock(rt->_surf, kIOSurfaceLockReadOnly, NULL);
+    VMTLTexture *r = rt && rt->_parent ? rt->_parent : rt;
+    if (!on || !r || !r->_surf) return;
+    const NSUInteger plane = r->_plane;
+    const size_t bpe = IOSurfaceGetBytesPerElementOfPlane(r->_surf, (uint32_t)plane);
+    if (bpe != 1 && bpe != 2 && bpe != 4) return;
+    if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) { static int said; if (!said++) nvlog("G16 cpu dump: IOSurfaceLock failed"); return; }
+    char tag[24];
+    if (IOSurfaceGetPlaneCount(r->_surf) > 1)
+        snprintf(tag, sizeof tag, "cpu%up%lu-", (unsigned)IOSurfaceGetID(r->_surf), (unsigned long)plane);
+    else
+        snprintf(tag, sizeof tag, "cpu%u-", (unsigned)IOSurfaceGetID(r->_surf));
+    vmtl_frame_dump(tag, IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)plane),
+                    IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)plane),
+                    (uint32_t)IOSurfaceGetWidthOfPlane(r->_surf, (uint32_t)plane),
+                    (uint32_t)IOSurfaceGetHeightOfPlane(r->_surf, (uint32_t)plane));
+    IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
 }
 static void vmtl_frame_dump(const char *tag, const void *base, size_t row, uint32_t w, uint32_t h) {
     if ((uint64_t)w * h < 1024 || access("/tmp/vmtl-dump-request", F_OK)) return;
@@ -953,14 +1091,95 @@ static void vmtl_frame_dump(const char *tag, const void *base, size_t row, uint3
     if (ok && rename(tmp, dst) == 0) { static int told; if (!told++) nvlog("G13 frame dump: %ux%u written to %s", w, h, dst); }
     else { unlink(tmp); static int said2; if (!said2++) nvlog("G13 frame dump: write FAILED (errno %d)", errno); }
 }
-static void vmtl_blit_dump(VMTLTexture *d) {
+static void vmtl_blit_dump(VMTLTexture *d, const char *kind, unsigned sid) {
     nvk_image *i = [d nvi]; if (!i || i->w < 1000 || i->h < 100 || i->bpp != 4) return;
-    static uint64_t last; uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
-    if ((last && now - last < 2000000000ull) || access("/tmp/vmtl-dump-request", F_OK)) return;
-    last = now; size_t row = (size_t)i->w * 4; void *px = malloc(row * i->h);
+    if (access("/tmp/vmtl-dump-request", F_OK)) return;
+    size_t row = (size_t)i->w * 4; void *px = malloc(row * i->h);
     if (!px) { nvlog("G17 blit dump: malloc FAILED"); return; }
-    if (vmtl_vk_image_read(d->_q, i, px, row)) nvlog("G17 blit dump: readback FAILED");
-    else { char tag[24]; snprintf(tag, sizeof tag, "blit%u-", vmtl_surf_id(d)); vmtl_frame_dump(tag, px, row, i->w, i->h); }
+    if (vmtl_vk_image_read_region_level(d->_q, i, px, row, 0, 0, i->w, i->h, 0))
+        nvlog("G17 blit dump: %s readback FAILED", kind);
+    else { char tag[24]; snprintf(tag, sizeof tag, "%s%u-", kind, sid); vmtl_frame_dump(tag, px, row, i->w, i->h); }
+    free(px);
+}
+/* Diagnostic only: compare the exact multi-plane IOSurface bytes dumped at bind
+   time with the sampled Vulkan image after the command buffer completes. */
+static void vmtl_plane_gpu_dump(VMTLTexture *t) {
+    nvk_image *i = [t nvi];
+    VMTLTexture *r = t->_parent ? t->_parent : t;
+    if (!i || !r->_surf || i->w < 1000 || (i->bpp != 1 && i->bpp != 2 && i->bpp != 4)) return;
+    size_t row = (size_t)i->w * i->bpp;
+    void *px = malloc(row * i->h);
+    if (!px) { nvlog("YCBCRSNAP malloc FAILED"); return; }
+    int err = 0;
+    for (uint32_t y = 0; y < i->h && !err; y += 128) {
+        const uint32_t h = i->h - y < 128 ? i->h - y : 128;
+        err = vmtl_vk_image_read_region_level(t->_q, i, (uint8_t *)px + (size_t)y * row,
+                                              row, 0, y, i->w, h, 0);
+    }
+    if (err)
+        nvlog("YCBCRSNAP GPU readback FAILED");
+    else {
+        char tag[24];
+        snprintf(tag, sizeof tag, "gpu%up%lu-", (unsigned)IOSurfaceGetID(r->_surf), (unsigned long)r->_plane);
+        vmtl_frame_dump(tag, px, row, i->w, i->h);
+    }
+    free(px);
+}
+/* Boot diagnostic: preserve each selected pass separately.  The generic frame
+   dump intentionally throttles and reuses names, which would lose seq pairs. */
+static void vmtl_plane_seq_write(const char *kind, unsigned seq, VMTLTexture *t,
+                                 const void *base, size_t row, uint32_t w, uint32_t h) {
+    VMTLTexture *r = t->_parent ? t->_parent : t;
+    char path[240], tmp[256];
+    snprintf(path, sizeof path, "/tmp/vmtl-plane-%d-%03u-%s%up%lu-%ux%u.nvf",
+             (int)getpid(), seq, kind, (unsigned)IOSurfaceGetID(r->_surf),
+             (unsigned long)r->_plane, w, h);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) { nvlog("PLANESNAP %u open FAILED errno %d", seq, errno); return; }
+    uint32_t hdr[4] = { 0x3146564e, w, h, (uint32_t)row };
+    const uint8_t *p = (const uint8_t *)base;
+    size_t left = row * h, off = 0;
+    int ok = write(fd, hdr, sizeof hdr) == (ssize_t)sizeof hdr;
+    while (ok && off < left) {
+        ssize_t n = write(fd, p + off, left - off);
+        if (n <= 0) ok = 0;
+        else off += (size_t)n;
+    }
+    if (close(fd)) ok = 0;
+    if (ok && rename(tmp, path) == 0)
+        nvlog("PLANESNAP %u %s surf %u plane %lu written", seq, kind,
+              (unsigned)IOSurfaceGetID(r->_surf), (unsigned long)r->_plane);
+    else { unlink(tmp); nvlog("PLANESNAP %u write FAILED errno %d", seq, errno); }
+}
+static void vmtl_plane_cpu_seq_dump(VMTLTexture *t, unsigned seq) {
+    VMTLTexture *r = t->_parent ? t->_parent : t;
+    if (!r->_surf) return;
+    const NSUInteger plane = r->_plane;
+    if (IOSurfaceLock(r->_surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
+        nvlog("PLANESNAP %u CPU lock FAILED", seq); return;
+    }
+    vmtl_plane_seq_write("cpu", seq, t,
+        IOSurfaceGetBaseAddressOfPlane(r->_surf, (uint32_t)plane),
+        IOSurfaceGetBytesPerRowOfPlane(r->_surf, (uint32_t)plane),
+        (uint32_t)IOSurfaceGetWidthOfPlane(r->_surf, (uint32_t)plane),
+        (uint32_t)IOSurfaceGetHeightOfPlane(r->_surf, (uint32_t)plane));
+    IOSurfaceUnlock(r->_surf, kIOSurfaceLockReadOnly, NULL);
+}
+static void vmtl_plane_gpu_seq_dump(VMTLTexture *t, unsigned seq) {
+    nvk_image *i = [t nvi];
+    if (!i || (i->bpp != 1 && i->bpp != 2 && i->bpp != 4)) return;
+    const size_t row = (size_t)i->w * i->bpp;
+    void *px = malloc(row * i->h);
+    if (!px) { nvlog("PLANESNAP %u GPU malloc FAILED", seq); return; }
+    int err = 0;
+    for (uint32_t y = 0; y < i->h && !err; y += 128) {
+        const uint32_t h = i->h - y < 128 ? i->h - y : 128;
+        err = vmtl_vk_image_read_region_level(t->_q, i, (uint8_t *)px + (size_t)y * row,
+                                              row, 0, y, i->w, h, 0);
+    }
+    if (err) nvlog("PLANESNAP %u GPU readback FAILED rc %d", seq, err);
+    else vmtl_plane_seq_write("gpu", seq, t, px, row, i->w, i->h);
     free(px);
 }
 #pragma mark - texture
@@ -1001,10 +1220,11 @@ extern int vmtl_depthfmt_public(MTLPixelFormat, uint32_t *, uint32_t *);
 - (id<MTLHeap>)heap { return _heap ?: _subHeap; }
 - (NSUInteger)heapOffset { return _heapOffset; }
 - (void)dealloc {
+    // Return heap slots to the dummy view before any view they could name is destroyed.
+    if (_resid) vmtl_resid_texture_gone(_resid);
     if (_sampledDepthView) vmtl_vk_image_view_destroy(_sampledDepthView);
     vmtl_tex_objs_gone++;
     if (_tbView || _tbAlias) { vmtl_vk_texel_view_destroy(_tbAlias, _tbView); _tbView = _tbAlias = NULL; }
-    if (_resid) vmtl_resid_texture_gone(_resid);
     if (_ownView) vmtl_vk_image_view_destroy(_ownView);
     if (!_parent && _parkable && _subHeap && _i.img) vmtl_heap_park(_subHeap, &_i, _pkey, _heapOffset, _pkLen);
     if (!_parent && _bparkable && _backBuf && _i.img) vmtl_bpark_put(_backBuf, &_i, _pkey);
@@ -1026,8 +1246,35 @@ extern int vmtl_depthfmt_public(MTLPixelFormat, uint32_t *, uint32_t *);
         (void *)_surf, (unsigned long)_plane, _i.w, _i.h, _i.bpp, IOSurfaceGetBytesPerElementOfPlane(_surf, (uint32_t)_plane));
     return NO;
 }
-- (void)vmtlSurfaceIn {
+static uint64_t vmtl_icon_pixels_hash(const uint8_t *pixels, size_t row, uint32_t w, uint32_t h)
+{
+    uint64_t hash = 1469598103934665603ull;
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w * 4; x++) {
+            hash ^= pixels[(size_t)y * row + x];
+            hash *= 1099511628211ull;
+        }
+    return hash;
+}
+static void vmtl_retain_resource(VMTLCommandBuffer *cb, id resource);
+static __thread VMTLCommandBuffer *__unsafe_unretained vmtl_surface_cmd;
+static BOOL vmtl_tiled_upload(VMTLTexture *r) {
+    void *base = [(VMTLBuffer *)r->_backBuf contents];
+    int rc = base ? vmtl_vk_image_write(r->_q, &r->_i, (char *)base + r->_backOff, r->_backBPR) : -1;
+    if (rc) { static unsigned n; if (n++ < 4 || n % 1000 == 0) nvlog("tiled copy: source-buffer upload FAILED (%ux%u bpr %lu)", r->_i.w, r->_i.h, (unsigned long)r->_backBPR); }
+    return rc == 0;
+}
+- (void)didModifyData {
     VMTLTexture *r = _parent ? _parent : self;
+    if (r->_tiledCopy) __atomic_store_n(&r->_tiledDirty, YES, __ATOMIC_RELEASE);
+}
+- (void)vmtlSurfaceInDirect {
+    VMTLTexture *r = _parent ? _parent : self;
+    if (r->_tiledCopy) {
+        __atomic_store_n(&r->_tiledDirty, NO, __ATOMIC_RELEASE);
+        if (!vmtl_tiled_upload(r)) __atomic_store_n(&r->_tiledDirty, YES, __ATOMIC_RELEASE);
+        return;
+    }
     if (!r->_surf) return;
     const uint32_t vgen = r->_vramOn ? 0 : vmtl_vram_gen(r->_surf, r->_plane);
     if (r->_surfSynced && IOSurfaceGetSeed(r->_surf) == r->_surfSeed && (r->_vramOn || vgen == r->_surfGen)) return;
@@ -1048,6 +1295,56 @@ extern int vmtl_depthfmt_public(MTLPixelFormat, uint32_t *, uint32_t *);
     r->_surfSeed = seed; r->_surfSynced = YES; r->_surfGen = vgen;
     g_surfin_copy++; if (r->_vramOn) vmtl_vram_tag_set(r->_surf, r->_plane, seed);
     static unsigned n; if (n++ < 6 || n % 2000 == 0) nvlog("G13 surface-in #%u: %ux%u surface %p seed %u uploaded", n, r->_i.w, r->_i.h, (void *)r->_surf, seed);
+}
+- (void)vmtlSurfaceInCmd:(VMTLCommandBuffer *)cb {
+    VMTLTexture *r = _parent ? _parent : self;
+    if (r->_tiledCopy && cb) {
+        if (cb->_tiledPart != cb->_parts.count) {
+            [cb->_tiledSynced removeAllObjects];
+            cb->_tiledPart = cb->_parts.count;
+        }
+        if ([cb->_tiledSynced containsObject:r] &&
+            !__atomic_load_n(&r->_tiledDirty, __ATOMIC_ACQUIRE)) return;
+        if (!cb->_c.in_rp && r->_backBPR <= UINT32_MAX) {
+            VMTLBuffer *b = r->_backBuf;
+            if (b && b->_b.buf) {
+                vmtl_retain_resource(cb, r);
+                vmtl_retain_resource(cb, b);
+                __atomic_store_n(&r->_tiledDirty, NO, __ATOMIC_RELEASE);
+                int rc = vmtl_vk_cmd_copy_buffer_to_image_layer(&cb->_c, &b->_b, r->_backOff, (uint32_t)r->_backBPR,
+                                                               &r->_i, 0, 0, r->_i.w, r->_i.h, 0);
+                if (!rc) {
+                    if (!cb->_tiledSynced) cb->_tiledSynced = [VMTLResSet new];
+                    [cb->_tiledSynced addObject:r];
+                    static unsigned n;
+                    if (!n++) nvlog("tiled copy: source-buffer copies are recorded before the render/compute work that samples them (no encode-time upload)");
+                    return;
+                }
+                static unsigned bad;
+                __atomic_store_n(&r->_tiledDirty, YES, __ATOMIC_RELEASE);
+                if (bad++ < 4 || bad % 1000 == 0)
+                    nvlog("tiled copy: recording source-buffer copy FAILED (%ux%u bpr %lu); using the synchronous fallback",
+                          r->_i.w, r->_i.h, (unsigned long)r->_backBPR);
+            }
+        }
+        __atomic_store_n(&r->_tiledDirty, NO, __ATOMIC_RELEASE);
+        if (vmtl_tiled_upload(r)) {
+            if (!cb->_tiledSynced) cb->_tiledSynced = [VMTLResSet new];
+            [cb->_tiledSynced addObject:r];
+        } else {
+            __atomic_store_n(&r->_tiledDirty, YES, __ATOMIC_RELEASE);
+        }
+        return;
+    }
+    [self vmtlSurfaceInDirect];
+}
+- (void)vmtlSurfaceIn {
+    VMTLTexture *r = _parent ? _parent : self;
+    if (r->_tiledCopy && vmtl_surface_cmd) {
+        [self vmtlSurfaceInCmd:vmtl_surface_cmd];
+        return;
+    }
+    [self vmtlSurfaceInDirect];
 }
 - (BOOL)vmtlSurfaceOut {
     VMTLTexture *r = _parent ? _parent : self;
@@ -1185,10 +1482,15 @@ extern int vmtl_depthfmt_public(MTLPixelFormat, uint32_t *, uint32_t *);
             [self nvi]->w, [self nvi]->h, vmtl_surf_id(self), nz, nn); }
       g_trace_mute = was; }
     [self vmtlSurfaceIn];
+    const BOOL iconTrace = vmtl_icon_trace_diag() && [self nvi]->w == 128 && [self nvi]->h == 128 && [self nvi]->bpp == 4;
+    if (iconTrace)
+        vmtl_icon_log("ICONREPLACE begin tex %p img %p q %p region %lux%lu row %lu", (__bridge void *)self,
+              [self nvi], _q, (unsigned long)region.size.width, (unsigned long)region.size.height, (unsigned long)row);
     if (vmtl_vk_image_write_region_level_layer(_q, [self nvi], (const uint8_t *)bytes, row, (uint32_t)region.origin.x, (uint32_t)region.origin.y,
                                                 (uint32_t)region.size.width, (uint32_t)region.size.height, (uint32_t)level + _baseLevel, _baseSlice))
         nvlog("replaceRegion: upload FAILED");
     else [self vmtlSurfaceOut];
+    if (iconTrace) vmtl_icon_log("ICONREPLACE end tex %p", (__bridge void *)self);
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
             withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)img {
@@ -1203,11 +1505,19 @@ extern int vmtl_depthfmt_public(MTLPixelFormat, uint32_t *, uint32_t *);
     nvk_image *im = [self nvi]; BOOL vol = im->mtl_type == 7; NSUInteger nz = vol ? (region.size.depth ? region.size.depth : 1) : 1;
     if (!vol && (region.size.depth > 1 || region.origin.z)) { nvlog("replaceRegion:slice: depth %lu@z%lu on a non-3D texture — REFUSED", (unsigned long)region.size.depth, (unsigned long)region.origin.z); return; }
     NSUInteger per = img ? img : row * region.size.height; int rc = 0;
+    const BOOL iconTrace = vmtl_icon_trace_diag() && im->w == 128 && im->h == 128 && im->bpp == 4;
+    if (iconTrace)
+        vmtl_icon_log("ICONREPLACE slice begin tex %p img %p q %p region %lux%lu row %lu level %lu slice %lu hash %016llx",
+              (__bridge void *)self, im, _q, (unsigned long)region.size.width,
+              (unsigned long)region.size.height, (unsigned long)row,
+              (unsigned long)level, (unsigned long)slice,
+              (unsigned long long)vmtl_icon_pixels_hash(bytes, row, (uint32_t)region.size.width, (uint32_t)region.size.height));
     for (NSUInteger zi = 0; zi < nz && !rc; zi++)
         rc = vmtl_vk_image_write_region_level_layer(_q, im, (const uint8_t *)bytes + zi * per, row, (uint32_t)region.origin.x, (uint32_t)region.origin.y,
                                                      (uint32_t)region.size.width, (uint32_t)region.size.height, (uint32_t)level + _baseLevel, (uint32_t)(vol ? region.origin.z + zi : slice + _baseSlice));
     if (rc) nvlog("replaceRegion:slice: upload FAILED");
     else [self vmtlSurfaceOut];
+    if (iconTrace) vmtl_icon_log("ICONREPLACE slice end tex %p rc %d", (__bridge void *)self, rc);
 }
 - (id<MTLTexture>)vmtlViewWithFormat:(MTLPixelFormat)f levels:(NSRange)levels {
     if (!levels.length || levels.location >= self.mipmapLevelCount || levels.length > self.mipmapLevelCount - levels.location) return nil;
@@ -2027,20 +2337,28 @@ extern NSData *vmtl_compile_library_entry(NSData *, NSString *, NSString *, NSSt
 - (id<MTLDevice>)device { return (id<MTLDevice>)gVMTLMainDevice; }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
     NSData *spv = [_fns objectForKey:name];
-    if (!spv && !_airs[name]) { nvlog("library: no function \"%s\" (this library holds %lu, externs %lu)", name.UTF8String, (unsigned long)(_fns.count + _airs.count), (unsigned long)_externs.count); return nil; }
+    NSString *air = _airs[name];   /* the AIR *text*; nil when the index only kept the compiled blob */
+    if (!spv && !air) { nvlog("library: no function \"%s\" (this library holds %lu, externs %lu)", name.UTF8String, (unsigned long)(_fns.count + _airs.count), (unsigned long)_externs.count); return nil; }
     if (spv && ([_stages[name] isEqualToString:@"mesh"] || [_stages[name] isEqualToString:@"object"])) {
         VMTLFunction *f = [VMTLFunction new]; f->_spirv = nil; f->_fname = name; f->_stage = _stages[name];
-        f->_air = _airs[name]; f->_lib = self; return f;
+        f->_air = air; f->_lib = self; return f;
     }
-    if (spv && [_airs[name] rangeOfString:@"@air.dyld_lib_table"].location != NSNotFound) {
+    /* The two DEFER checks read the AIR text, so they must not run when there is
+       none: [nil rangeOfString:] returns {0,0}, whose .location (0) is not
+       NSNotFound, so the test used to pass on a NULL string and defer a function
+       with no AIR. Linking then handed a NULL AIR to the translator, which
+       returned an empty error - CoreAnimation aborted with
+       "cannot read its visible references ()". Falling through instead lets the
+       blob below compile normally. */
+    if (spv && air && [air rangeOfString:@"@air.dyld_lib_table"].location != NSNotFound) {
         nvlog("library: \"%s\" was compiled against a dynamic library - DEFERRED to pipeline creation", name.UTF8String);
         VMTLFunction *f = [VMTLFunction new]; f->_spirv = nil; f->_fname = name; f->_stage = (_stages[name] ?: @"");
-        f->_air = _airs[name]; f->_lib = self; f->_needsLink = YES; return f;
+        f->_air = air; f->_lib = self; f->_needsLink = YES; return f;
     }
-    if (spv && [_airs[name] rangeOfString:@"!\"air.intersection_function_table\""].location != NSNotFound) {
+    if (spv && air && [air rangeOfString:@"!\"air.intersection_function_table\""].location != NSNotFound) {
         nvlog("library: \"%s\" takes an intersection function table - DEFERRED to pipeline creation", name.UTF8String);
         VMTLFunction *f = [VMTLFunction new]; f->_spirv = nil; f->_fname = name; f->_stage = (_stages[name] ?: @"");
-        f->_air = _airs[name]; f->_lib = self; f->_needsLink = YES; return f;
+        f->_air = air; f->_lib = self; f->_needsLink = YES; return f;
     }
     if (spv) { NSError *te = nil; NSData *es = [self vmtlEntrySpirv:name error:&te];
         if (!es && _airs[name] && ([te.localizedDescription rangeOfString:@"Metal visible function table"].location != NSNotFound
@@ -2055,7 +2373,8 @@ extern NSData *vmtl_compile_library_entry(NSData *, NSString *, NSString *, NSSt
             f->_air = _airs[name]; f->_lib = self; return f;
         }
         spv = es; if (!spv) return nil; }
-    VMTLFunction *f = [VMTLFunction new]; f->_spirv = spv; f->_fname = name; f->_stage = (_stages[name] ?: @""); f->_air = _airs[name]; f->_lib = self; return f;
+    VMTLFunction *f = [VMTLFunction new]; f->_spirv = spv; f->_fname = name; f->_stage = (_stages[name] ?: @""); f->_air = _airs[name]; f->_lib = self;
+    return f;
 }
 static size_t vmtl_fc_width(NSUInteger dataType)
 {
@@ -2181,7 +2500,8 @@ static size_t vmtl_fc_width(NSUInteger dataType)
         return nil;
     }
     nvlog("newFunctionWithName:constantValues: \"%s\" specialized with %zu constant(s)", name.UTF8String, n);
-    VMTLFunction *f = [VMTLFunction new]; f->_spirv = spec; f->_fc = [constants copy]; f->_fname = name; f->_stage = (_stages[name] ?: @""); f->_air = _airs[name]; f->_lib = self; f->_fcv = cv; return f;
+    VMTLFunction *f = [VMTLFunction new]; f->_spirv = spec; f->_fc = [constants copy]; f->_fname = name; f->_stage = (_stages[name] ?: @""); f->_air = _airs[name]; f->_lib = self; f->_fcv = cv;
+    return f;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)cv
           completionHandler:(void (^)(id<MTLFunction>, NSError *))handler {
@@ -2424,9 +2744,44 @@ static NSDictionary *vmtl_pixel_sampler_norm(NSDictionary *m) {
         }
     }
     if(!_cb->_resources)_cb->_resources=[VMTLResSet new];[_cb->_resources addObject:selected];
-    vmtl_vk_cmd_bind_pipeline(&_cb->_c,&selected->_p);
+    VMTLCommandBuffer *surfacePrev = vmtl_surface_cmd;
+    vmtl_surface_cmd = _cb;
     vmtl_bind_embedded(_cb, VMTL_SET_VERTEX,   (VMTLFunction *)_ps->_descriptor.vertexFunction,   _vbufAt);
     vmtl_bind_embedded(_cb, VMTL_SET_FRAGMENT, (VMTLFunction *)_ps->_descriptor.fragmentFunction, _fbufAt);
+    vmtl_surface_cmd = surfacePrev;
+    if (!access("/var/tmp/vmtl-matrix-private-copy", F_OK)) {
+        const uint32_t fs = vmtl_ps_fragment_hash(_ps);
+        const uint64_t sy = _sc[1], sw = _sc[2], sh = _sc[3];
+        NSArray *binding = _fbufAt[@3];
+        VMTLBuffer *b = binding ? binding[0] : nil;
+        const NSUInteger off = binding ? [binding[1] unsignedLongValue] : 0;
+        const void *cpu = b ? vmtl_buf_cpu(b) : NULL;
+        if ((fs == 0x70415cd3 || fs == 0x397298c5) && sw == 17 && sh == 1 &&
+            sy < 736 && sy + sh > 640 && b && b->_b.size == 262144 && cpu &&
+            off <= b->_b.size && b->_b.size - off >= 48) {
+            nvk_buffer stable = {0};
+            const BOOL dedicated = !access("/var/tmp/vmtl-matrix-dedicated", F_OK);
+            const int made = dedicated ? vmtl_vk_buffer_create_unpooled(b->_b.size, 1, &stable)
+                                       : vmtl_vk_buffer_create(b->_b.size, 1, &stable);
+            if (!made && stable.map) {
+                if (!access("/var/tmp/vmtl-matrix-fill-white", F_OK)) {
+                    float *words = (float *)stable.map;
+                    for (size_t k = 0; k < b->_b.size / sizeof(*words); k++) words[k] = 1.0f;
+                } else memcpy(stable.map, cpu, b->_b.size);
+                const NSUInteger bindOff = off == 288 && !access("/var/tmp/vmtl-matrix-zero-offset", F_OK) ? 0 : off;
+                if (!vmtl_vk_bind_buffer(&_cb->_c, VMTL_SET_FRAGMENT, 3, &stable, bindOff)) {
+                    nvlog("MPRIV fs %08x original %p/%lu stable %p/%lu dedicated %d pool %p mem %p moff %lu", fs,
+                          b->_b.buf, (unsigned long)off, stable.buf, (unsigned long)bindOff,
+                          dedicated, stable.pool, stable.mem, (unsigned long)stable.moff);
+                    [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                        nvk_buffer done = stable; vmtl_vk_buffer_destroy(&done);
+                    }];
+                } else vmtl_vk_buffer_destroy(&stable);
+            } else if (stable.buf) vmtl_vk_buffer_destroy(&stable);
+        }
+    }
+    if (![self vmtlEnsurePass:selected]) return NO;
+    vmtl_vk_cmd_bind_pipeline(&_cb->_c,&selected->_p);
     vmtl_vk_cmd_bind_set(&_cb->_c,&selected->_p);
     return YES;
 }
@@ -2561,9 +2916,25 @@ static NSDictionary *vmtl_pixel_sampler_norm(NSDictionary *m) {
 - (BOOL)vmtlBeginPassLoad:(uint32_t)load {
     if (_refused || !_ps) return NO;
     uint32_t keep = _pass.load; _pass.load = load;
-    int rc = vmtl_vk_cmd_begin_pass(&_cb->_c, &_pass, &_ps->_p);
+    BOOL ok = [self vmtlEnsurePass:_ps];
     _pass.load = keep;
-    return rc == 0;
+    return ok;
+}
+- (BOOL)vmtlEnsurePass:(VMTLRenderPipelineState *)p {
+    if (_cb->_c.in_rp) return YES;
+    if (!_begun || !p) return NO;
+    if (vmtl_vk_cmd_begin_pass(&_cb->_c, &_pass, &p->_p)) {
+        nvlog("encoder: begin render FAILED immediately before its first draw");
+        if (_pass.sample_pattern.count)
+            return [self vmtlSamplePositionError:@"sample positions: cannot begin requested render pass"];
+        return NO;
+    }
+    [self vmtlBeginVisibility];
+    vmtl_vk_cmd_set_cull(&_cb->_c, _cull);
+    if (_hasVP) vmtl_vk_cmd_set_viewport(&_cb->_c, _vp[0], _vp[1], _vp[2], _vp[3], _vp[4], _vp[5]);
+    if (_hasSC) vmtl_vk_cmd_set_scissor(&_cb->_c, (int32_t)_sc[0], (int32_t)_sc[1], _sc[2], _sc[3]);
+    [self vmtlApplyDepthStencil];
+    return YES;
 }
 - (void)vmtlApplyDepthStencil {
     if (!_begun || !_ps || !_ps->_p.has_depth) return;
@@ -2590,6 +2961,16 @@ static NSDictionary *vmtl_pixel_sampler_norm(NSDictionary *m) {
                   [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
                   NSString *pth = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.%s.spv", h, s ? "frag" : "vert"]];
                   if (![[NSFileManager defaultManager] fileExistsAtPath:pth]) [d writeToFile:pth atomically:YES]; }
+              if ((h == 0x7cf3e68d || h == 0x9ffae72a) &&
+                  !access("/tmp/vmtl-skip-overlay-request", F_OK)) {
+                  NSString *pth = [NSString stringWithFormat:@"/private/tmp/vmtl-%08x.%s.spv", h, s ? "frag" : "vert"];
+                  if (![[NSFileManager defaultManager] fileExistsAtPath:pth]) [d writeToFile:pth atomically:YES];
+              }
+              if ((h == 0xf4f2a653 || h == 0x2601390d) &&
+                  !access("/tmp/vmtl-skip-uber-request", F_OK)) {
+                  NSString *pth = [NSString stringWithFormat:@"/private/tmp/vmtl-%08x.%s.spv", h, s ? "frag" : "vert"];
+                  if (![[NSFileManager defaultManager] fileExistsAtPath:pth]) [d writeToFile:pth atomically:YES];
+              }
           }
           char st[600]; vmtl_vk_pipeline_stats(p_->_p.pipe, st, sizeof st);
           nvtrace("PSO %p %s / %s vs %08x fs %08x | %s", (__bridge void *)ps, p_->_vname.UTF8String ?: "?", p_->_fname.UTF8String ?: "?", hv, hf, st);
@@ -2603,16 +2984,8 @@ static NSDictionary *vmtl_pixel_sampler_norm(NSDictionary *m) {
     vmtl_retain_resource(_cb, p);
     if (!_begun) {
         if (_refused) return;
-        if (vmtl_vk_cmd_begin_pass(&_cb->_c, &_pass, &p->_p)) {
-            nvlog("encoder: begin render FAILED — nothing is recorded for this pipeline");
-            if (_pass.sample_pattern.count) [self vmtlSamplePositionError:@"sample positions: cannot begin requested render pass"];
-            return; }
-        _begun = YES; [self vmtlBeginVisibility]; _passFmt = p->_p.cfmt; _passDepth = p->_p.has_depth; _passSamples = p->_p.samples; vmtl_vk_pipeline_sig(&p->_p, &_passSig);
+        _begun = YES; _passFmt = p->_p.cfmt; _passDepth = p->_p.has_depth; _passSamples = p->_p.samples; vmtl_vk_pipeline_sig(&p->_p, &_passSig);
         if (_resolve) { VMTLTexture *rs = _resolve->_parent ? _resolve->_parent : _resolve; if (rs->_surf) vmtl_surf_dirty(_cb, rs); }
-        vmtl_vk_cmd_set_cull(&_cb->_c, _cull);
-        if (_hasVP) vmtl_vk_cmd_set_viewport(&_cb->_c, _vp[0], _vp[1], _vp[2], _vp[3], _vp[4], _vp[5]);
-        if (_hasSC) vmtl_vk_cmd_set_scissor(&_cb->_c, (int32_t)_sc[0], (int32_t)_sc[1], _sc[2], _sc[3]);
-        [self vmtlApplyDepthStencil];
     } else if (!vmtl_vk_pipeline_compatible(&_passSig, &p->_p)) {
         static int said; if (said++ < 8) nvlog("G12 setRenderPipelineState: pipeline (fmt %u depth %d) does NOT match the pass in progress "
             "(fmt %u depth %d) — NOT bound, the earlier pipeline keeps drawing", p->_p.cfmt, p->_p.has_depth, _passFmt, _passDepth);
@@ -2653,7 +3026,8 @@ static NSDictionary *vmtl_pixel_sampler_norm(NSDictionary *m) {
     [_cb->_resources addObject:nb];
     if (!_vbufAt) _vbufAt = [NSMutableDictionary new];
     _vbufAt[@(i)] = @[nb, @(off)];
-    nvtrace_floats("VB", (unsigned long)i, (unsigned long)off, nb->_b.map, 24);
+    nvtrace_floats("VB", (unsigned long)i, (unsigned long)off,
+                   nb->_shadow.map ? nb->_shadow.map : nb->_b.map, 24);
     if (vmtl_vk_bind_buffer(&_cb->_c, VMTL_SET_VERTEX, (uint32_t)i, &nb->_b, off)) nvlog("setVertexBuffer: bind FAILED");
 }
 - (void)setVertexAccelerationStructure:(id<MTLAccelerationStructure>)as atBufferIndex:(NSUInteger)i { [self setVertexBuffer:(id<MTLBuffer>)as offset:0 atIndex:i];
@@ -2669,7 +3043,14 @@ static NSDictionary *vmtl_pixel_sampler_norm(NSDictionary *m) {
     [_cb->_resources addObject:nb];
     if (!_fbufAt) _fbufAt = [NSMutableDictionary new];
     _fbufAt[@(i)] = @[nb, @(off)];
-    nvtrace_floats("FB", (unsigned long)i, (unsigned long)off, nb->_b.map, 16);
+    nvtrace_floats("FB", (unsigned long)i, (unsigned long)off,
+                   nb->_b.map ? nb->_b.map : nb->_shadow.map, 16);
+    if (i == 3 && nb->_b.size == 262144 && vmtl_trace_on())
+        nvtrace("FBD[%lu] buf %p cb %p enc %p gpu 0x%llx off %lu shadow %p dirty %lu..%lu z %d",
+                (unsigned long)i, nb, _cb, self,
+                (unsigned long long)vmtl_vk_buffer_address(&nb->_b),
+                (unsigned long)off, nb->_shadow.map,
+                (unsigned long)nb->_dirtyLo, (unsigned long)nb->_dirtyHi, nb->_zshadow);
     if (vmtl_vk_bind_buffer(&_cb->_c, VMTL_SET_FRAGMENT, (uint32_t)i, &nb->_b, off)) nvlog("setFragmentBuffer: bind FAILED");
 }
 static VMTLBuffer *vmtl_bytes_ring(VMTLCommandBuffer *cb, NSUInteger len, size_t *off);
@@ -2697,7 +3078,7 @@ static VMTLBuffer *vmtl_bytes_ring(VMTLCommandBuffer *cb, NSUInteger len, size_t
     VMTLTexture *nt = (VMTLTexture *)t;
     if (!nt) { nvlog("setVertexTexture: nil at index %lu", (unsigned long)i); return; }
     vmtl_retain_resource(_cb, nt);
-    [nt vmtlSurfaceIn];
+    [nt vmtlSurfaceInCmd:_cb];
     if (nt->_tbView) vmtl_vk_bind_texel_view(&_cb->_c, VMTL_SET_VERTEX, (uint32_t)i, nt->_tbView, nt->_tbStorage);
     else {
     if (vmtl_vk_bind_texture_view(&_cb->_c, VMTL_SET_VERTEX, (uint32_t)i, [nt nvview])) nvlog("setVertexTexture: bind FAILED");
@@ -2726,12 +3107,348 @@ static VMTLBuffer *vmtl_bytes_ring(VMTLCommandBuffer *cb, NSUInteger len, size_t
     nvtrace("VERTEX SAMPLER[%lu] pixel=%d bound=%d",(unsigned long)i,ns && ns->_pixelState!=nil,ns!=nil);
     if(ns) { if (!_cb->_resources) _cb->_resources=[VMTLResSet new];[_cb->_resources addObject:ns]; }
 }
+/* Diagnostic only: retain the Dock strip after each render encoder.  The copy
+   is recorded after the pass has ended and read back only after completion, so
+   no synchronous readback is inserted into the command stream being measured. */
+static void vmtl_pass_snapshot(VMTLRenderCommandEncoder *enc)
+{
+    const BOOL first = vmtl_firstpass_diag();
+    const BOOL full = !access("/tmp/vmtl-fullpass-snapshot-request", F_OK) || vmtl_boot_diag() || first;
+    if ((!full && access("/tmp/vmtl-pass-snapshot-request", F_OK)) || !enc->_begun) return;
+    VMTLTexture *src = enc->_target;
+    VMTLTexture *root = src && src->_parent ? src->_parent : src;
+    nvk_image *si = root ? [root nvi] : NULL;
+    if (!root || (!full && !root->_surf) || !si || si->w != 1280 || si->h != 800 || si->bpp != 4 ||
+        root->_baseLevel || root->_baseSlice) return;
+    static _Atomic unsigned next;
+    const unsigned seq = atomic_fetch_add(&next, 1);
+    if (seq >= (full ? 112 : 512)) return;
+    if (vmtl_boot_diag() && seq < 64) return;
+    if (vmtl_boot_diag()) {
+        VMTLTexture *planes[2] = { enc->_diagPlane0, enc->_diagPlane1 };
+        for (unsigned k = 0; k < 2; k++) {
+            VMTLTexture *snap = planes[k];
+            if (!snap) continue;
+            nvtrace("PLANESNAP seq %u cb %p enc %p plane %u surf %u",
+                    seq, (__bridge void *)enc->_cb, (__bridge void *)enc, k,
+                    vmtl_surf_id(snap));
+            vmtl_plane_cpu_seq_dump(snap, seq);
+            [enc->_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_plane_gpu_seq_dump(snap, seq);
+            }];
+        }
+    }
+    const uint32_t x = 0, y = full ? 0 : 640, w = 1280, h = full ? 800 : 96;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+                                                                                  width:w height:h mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModePrivate;
+    VMTLTexture *copy = (VMTLTexture *)[[enc device] newTextureWithDescriptor:d];
+    if (!copy) { nvlog("PSNAP %u allocation FAILED", seq); return; }
+    if (vmtl_vk_cmd_copy_image_sub(&enc->_cb->_c, si, root->_baseLevel, root->_baseSlice,
+                                   x, y, [copy nvi], 0, 0, 0, 0, w, h)) {
+        nvlog("PSNAP %u copy FAILED", seq); return;
+    }
+    if (!enc->_cb->_scratch) enc->_cb->_scratch = [NSMutableArray new];
+    [enc->_cb->_scratch addObject:copy];
+    const unsigned sid = root->_surf ? (unsigned)IOSurfaceGetID(root->_surf) : 0u;
+    nvtrace("PSNAP seq %u cb %p enc %p surf %u rect %u,%u %ux%u sc %u,%u %ux%u ps %s/%s",
+            seq, (__bridge void *)enc->_cb, (__bridge void *)enc, sid, x, y, w, h,
+            enc->_hasSC ? enc->_sc[0] : 0, enc->_hasSC ? enc->_sc[1] : 0,
+            enc->_hasSC ? enc->_sc[2] : 0, enc->_hasSC ? enc->_sc[3] : 0,
+            enc->_ps->_vname.UTF8String ?: "?", enc->_ps->_fname.UTF8String ?: "?");
+    [enc->_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        const size_t row = (size_t)w * 4;
+        void *px = malloc(row * h);
+        if (!px) { nvlog("PSNAP %u readback malloc FAILED", seq); return; }
+        int rc = vmtl_vk_image_read_region_level(copy->_q, [copy nvi], px, row,
+                                                 0, 0, w, h, 0);
+        if (rc) { nvlog("PSNAP %u readback FAILED rc %d", seq, rc); free(px); return; }
+        char path[160], tmp[176];
+        snprintf(path, sizeof path, "/tmp/vmtl-pass-%d-%02u-surf%u.bgra", (int)getpid(), seq, sid);
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        uint32_t hdr[4] = { 0x3146564e, w, h, (uint32_t)row };
+        int ok = fd >= 0 && write(fd, hdr, sizeof hdr) == (ssize_t)sizeof hdr &&
+                 write(fd, px, row * h) == (ssize_t)(row * h);
+        if (fd >= 0) close(fd);
+        if (ok && rename(tmp, path) == 0) nvlog("PSNAP %u surf %u written", seq, sid);
+        else { unlink(tmp); nvlog("PSNAP %u write FAILED errno %d", seq, errno); }
+        free(px);
+    }];
+}
+
+static VMTLTexture *vmtl_feedback_snapshot(VMTLRenderCommandEncoder *enc, VMTLTexture *src)
+{
+    if (!enc->_begun || !enc->_ps || enc->_visActive || enc->_visPending ||
+        src->_parent || src->_viewParent || src->_tbView) return src;
+    nvk_image *si = [src nvi];
+    if (!si || si->mtl_type != 2 || (si->samples ? si->samples : 1) != 1) return src;
+
+    uint32_t w = 0, h = 0;
+    for (uint32_t i = 0; i < VMTL_NCOL; i++) {
+        if (enc->_pass.col[i] != si || enc->_pass.col_level[i] != src->_baseLevel ||
+            enc->_pass.col_layer[i] != src->_baseSlice) continue;
+        w = enc->_pass.colw[i]; h = enc->_pass.colh[i];
+        break;
+    }
+    if (!w || !h) return src;
+
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+                                                                                  width:w height:h mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModePrivate;
+    VMTLTexture *copy = (VMTLTexture *)[[enc device] newTextureWithDescriptor:d];
+    if (!copy) { nvlog("feedback: cannot allocate %ux%u source snapshot", w, h); return src; }
+    /* A sampled attachment cannot be copied inside its own render pass.  Close
+       the pass after applying its load action, snapshot it, and let the next
+       draw reopen it with the just-written contents rather than its clear. */
+    if (![enc vmtlEnsurePass:enc->_ps]) return src;
+    if (enc->_cb->_c.in_rp) vmtl_vk_cmd_end_render(&enc->_cb->_c);
+    enc->_pass.load = VMTL_LOAD_ALL;
+    if (vmtl_vk_cmd_copy_image_sub(&enc->_cb->_c, si, src->_baseLevel, src->_baseSlice,
+                                   0, 0, [copy nvi], 0, 0, 0, 0, w, h)) {
+        nvlog("feedback: %ux%u source snapshot copy FAILED", w, h);
+        return src;
+    }
+    if (!enc->_cb->_scratch) enc->_cb->_scratch = [NSMutableArray new];
+    [enc->_cb->_scratch addObject:copy];
+    static uint64_t dumpAfter;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    if (w >= 1000 && !access("/tmp/vmtl-dump-request", F_OK) &&
+        (!dumpAfter || now - dumpAfter >= 2000000000ull)) {
+        unsigned sid = vmtl_surf_id(src);
+        dumpAfter = now;
+        [enc->_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            vmtl_blit_dump(copy, "pre", sid);
+            vmtl_blit_dump(src, "post", sid);
+        }];
+    }
+    static unsigned n;
+    if (n++ < 8 || n % 256 == 0)
+        nvlog("feedback: snapshot %ux%u level %u slice %u before sampling its attachment (#%u)",
+              w, h, src->_baseLevel, src->_baseSlice, n);
+    nvtrace("FEEDBACK snapshot %ux%u level %u slice %u", w, h, src->_baseLevel, src->_baseSlice);
+    return copy;
+}
+static uint32_t vmtl_ps_fragment_hash(VMTLRenderPipelineState *ps)
+{
+    VMTLFunction *ff = (VMTLFunction *)ps->_descriptor.fragmentFunction;
+    if (![ff isKindOfClass:[VMTLFunction class]]) return 0;
+    NSData *d = ff->_spirv;
+    uint32_t h = 2166136261u;
+    const uint8_t *bytes = d.bytes;
+    for (NSUInteger i = 0; i < d.length; i++) { h ^= bytes[i]; h *= 16777619u; }
+    return h;
+}
+static void vmtl_overlay_gpu_dump(VMTLTexture *t, uint32_t slot)
+{
+    nvk_image *image = [t nvi];
+    nvtrace("OLDUMP slot %u texture %p image %p %ux%u bpp %u queue %p",
+            slot, t, image, image ? image->w : 0, image ? image->h : 0,
+            image ? image->bpp : 0, t->_q);
+    if (!image || image->w > 512 || image->h > 512 || image->bpp != 4) return;
+    const size_t row = (size_t)image->w * 4, bytes = row * image->h;
+    void *pixels = malloc(bytes);
+    if (!pixels) { nvlog("OLSNAP allocation FAILED"); return; }
+    nvtrace("OLREAD slot %u begin", slot);
+    if (vmtl_vk_image_read_region_level(t->_q, image, pixels, row, 0, 0,
+                                       image->w, image->h, 0)) {
+        nvlog("OLSNAP GPU readback FAILED"); free(pixels); return;
+    }
+    nvtrace("OLREAD slot %u done", slot);
+    char path[160], tmp[176];
+    snprintf(path, sizeof path, "/tmp/vmtl-overlay-%d-%u.bgra", (int)getpid(), slot);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    const uint32_t header[4] = { 0x314c4f56, image->w, image->h, (uint32_t)row };
+    const int ok = fd >= 0 && write(fd, header, sizeof header) == (ssize_t)sizeof header &&
+                   write(fd, pixels, bytes) == (ssize_t)bytes;
+    if (fd >= 0) close(fd);
+    if (ok && rename(tmp, path) == 0) nvtrace("OLWRITE slot %u path %s", slot, path);
+    else { unlink(tmp); nvlog("OLSNAP write FAILED"); }
+    free(pixels);
+}
+/* Diagnostic only: inspect Dock icon sources after their consuming command
+   buffer completes, without adding work to the encoded render pass. */
+static void vmtl_icon_gpu_dump(VMTLTexture *t, unsigned slot)
+{
+    nvk_image *image = [t nvi];
+    if (!image || image->w != 128 || image->h != 128 || image->bpp != 4) return;
+    const BOOL allMips = !access("/var/tmp/vmtl-icon-mips", F_OK);
+    const uint32_t levels = allMips ? (image->mips ? image->mips : 1) : 1;
+    for (uint32_t level = 0; level < levels; level++) {
+        const uint32_t w = MAX(1u, image->w >> level), h = MAX(1u, image->h >> level);
+        const size_t row = (size_t)w * 4;
+        void *pixels = malloc(row * h);
+        if (!pixels) { vmtl_icon_log("ICONSNAP %u level %u malloc FAILED", slot, level); continue; }
+        if (vmtl_vk_image_read_region_level(t->_q, image, pixels, row, 0, 0, w, h, level)) {
+            vmtl_icon_log("ICONSNAP %u level %u readback FAILED", slot, level);
+        } else {
+            vmtl_icon_log("ICONMIP slot %u tex %p level %u size %ux%u hash %016llx",
+                          slot, (__bridge void *)t, level, w, h,
+                          (unsigned long long)vmtl_icon_pixels_hash(pixels, row, w, h));
+            char path[200], tmp[216];
+            if (allMips)
+                snprintf(path, sizeof path, "/tmp/vmtl-icon-%d-%02u-l%u-f%lu.bgra",
+                         (int)getpid(), slot, level, (unsigned long)[t pixelFormat]);
+            else
+                snprintf(path, sizeof path, "/tmp/vmtl-icon-%d-%02u-f%lu.bgra",
+                         (int)getpid(), slot, (unsigned long)[t pixelFormat]);
+            snprintf(tmp, sizeof tmp, "%s.tmp", path);
+            int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            const uint32_t header[4] = { 0x3146564e, w, h, (uint32_t)row };
+            int ok = fd >= 0 && write(fd, header, sizeof header) == (ssize_t)sizeof header &&
+                     write(fd, pixels, row * h) == (ssize_t)(row * h);
+            if (fd >= 0 && close(fd)) ok = 0;
+            if (!(ok && rename(tmp, path) == 0)) {
+                unlink(tmp);
+                vmtl_icon_log("ICONSNAP %u level %u write FAILED errno %d", slot, level, errno);
+            }
+        }
+        free(pixels);
+    }
+}
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {
     VMTLTexture *nt = (VMTLTexture *)t;
     if (!nt) { nvlog("setFragmentTexture: nil at index %lu", (unsigned long)i); return; }
     vmtl_retain_resource(_cb, nt);
-    vmtl_surface_cpu_dump(nt->_parent ? nt->_parent : nt);
-    [nt vmtlSurfaceIn];
+    vmtl_surface_cpu_dump(nt);
+    [nt vmtlSurfaceInCmd:_cb];
+    static _Atomic unsigned planeSnaps;
+    VMTLTexture *planeRoot = nt->_parent ? nt->_parent : nt;
+    if ((vmtl_boot_diag() || !access("/tmp/vmtl-draw-boundary-request", F_OK)) &&
+        _ps && planeRoot->_surf && IOSurfaceGetPlaneCount(planeRoot->_surf) > 1 &&
+        (vmtl_ps_fragment_hash(_ps) == 0x70415cd3 ||
+         vmtl_ps_fragment_hash(_ps) == 0x397298c5)) {
+        if (i == 3) _diagPlane0 = nt;
+        else if (i == 5) _diagPlane1 = nt;
+    }
+    if (!access("/tmp/vmtl-ycbcr-snapshot-request", F_OK) && planeRoot->_surf &&
+        IOSurfaceGetPlaneCount(planeRoot->_surf) > 1 && [nt nvi]->w >= 1000) {
+        unsigned slot = atomic_fetch_add(&planeSnaps, 1);
+        if (slot < 2) {
+            VMTLTexture *snap = nt;
+            [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_plane_gpu_dump(snap);
+            }];
+        }
+    }
+    VMTLTexture *feedbackSrc = nt;
+    const BOOL cursorTrace = _ps && vmtl_ps_fragment_hash(_ps) == 0xf4f2a653 &&
+                             !access("/var/tmp/vmtl-cursor-trace", F_OK);
+    if (cursorTrace) {
+        nvk_image *si = [nt nvi];
+        VMTLTexture *targetRoot = _target ? (_target->_parent ? _target->_parent : _target) : nil;
+        VMTLTexture *sourceRoot = nt->_parent ? nt->_parent : nt;
+        uint32_t colmatch = 0;
+        for (uint32_t j = 0; j < VMTL_NCOL; j++)
+            if (_pass.col[j] == si && _pass.col_level[j] == nt->_baseLevel &&
+                _pass.col_layer[j] == nt->_baseSlice) colmatch |= 1u << j;
+        vmtl_icon_log("CURSORPRE enc %p cb %p index %lu src %p size %ux%u parent %p viewParent %p tb %p "
+                      "target %p root %p size %ux%u tsurf %u ssurf %u sameRoot %d colmatch %u "
+                      "level %u slice %u begun %d vis %d/%d",
+                      (__bridge void *)self, (__bridge void *)_cb, (unsigned long)i,
+                      (__bridge void *)nt, si ? si->w : 0, si ? si->h : 0,
+                      (__bridge void *)nt->_parent, (__bridge void *)nt->_viewParent,
+                      (void *)nt->_tbView, (__bridge void *)_target, (__bridge void *)targetRoot,
+                      targetRoot ? [targetRoot nvi]->w : 0, targetRoot ? [targetRoot nvi]->h : 0,
+                      targetRoot && targetRoot->_surf ? (unsigned)IOSurfaceGetID(targetRoot->_surf) : 0,
+                      sourceRoot && sourceRoot->_surf ? (unsigned)IOSurfaceGetID(sourceRoot->_surf) : 0,
+                      targetRoot && sourceRoot == targetRoot, colmatch,
+                      nt->_baseLevel, nt->_baseSlice, _begun, _visActive, _visPending);
+    }
+    nt = vmtl_feedback_snapshot(self, nt);
+    if (cursorTrace)
+        vmtl_icon_log("CURSORPOST enc %p cb %p index %lu in %p out %p copied %d outsize %ux%u",
+                      (__bridge void *)self, (__bridge void *)_cb, (unsigned long)i,
+                      (__bridge void *)feedbackSrc, (__bridge void *)nt, nt != feedbackSrc,
+                      [nt nvi]->w, [nt nvi]->h);
+    if (i == 0 && nt && [nt nvi]->w == 17 && [nt nvi]->h == 23 && _ps &&
+        !access("/tmp/vmtl-cursor-snapshot-request", F_OK) &&
+        vmtl_ps_fragment_hash(_ps) == 0xf4f2a653) {
+        static _Atomic unsigned cursorSnaps;
+        const uint32_t slot = atomic_fetch_add(&cursorSnaps, 1);
+        if (slot < 512) {
+            VMTLTexture *snap = nt;
+            nvtrace("CURSNAP slot %u cb %p enc %p view %p", slot,
+                    (__bridge void *)_cb, (__bridge void *)self, [snap nvview]);
+            [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_overlay_gpu_dump(snap, slot);
+            }];
+        }
+    }
+    if (i == 3 && nt && [nt nvi]->w == 90 && [nt nvi]->h == 62 && _ps &&
+        !access("/tmp/vmtl-overlay-snapshot-request", F_OK) &&
+        vmtl_ps_fragment_hash(_ps) == 0x7cf3e68d) {
+        static _Atomic unsigned overlaySnaps;
+        const uint32_t slot = atomic_fetch_add(&overlaySnaps, 1);
+        if (slot < 512) {
+            VMTLTexture *snap = nt;
+            nvtrace("OLSNAP slot %u cb %p enc %p view %p", slot,
+                    (__bridge void *)_cb, (__bridge void *)self, [snap nvview]);
+            [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_overlay_gpu_dump(snap, slot);
+            }];
+        }
+    }
+    if (i == 3 && nt && [nt nvi]->w == 128 && [nt nvi]->h == 128 &&
+        [nt nvi]->bpp == 4 && _ps &&
+        !access("/var/tmp/vmtl-icon-capture", F_OK) &&
+        vmtl_ps_fragment_hash(_ps) == 0x397298c5) {
+        static _Atomic unsigned iconSnaps;
+        const uint32_t slot = atomic_fetch_add(&iconSnaps, 1);
+        const BOOL allMips = !access("/var/tmp/vmtl-icon-mips", F_OK);
+        if (slot < (allMips ? 23 : 64)) {
+            VMTLTexture *snap = nt;
+            if (slot == 0 && self->_target && !allMips) {
+                VMTLTexture *target = self->_target;
+                VMTLTexture *root = target->_parent ? target->_parent : target;
+                if (root->_surf && [root nvi]->w == 1280 && [root nvi]->h == 800) {
+                    [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                        vmtl_plane_gpu_seq_dump(target, 0);
+                    }];
+                }
+            }
+            [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_icon_gpu_dump(snap, slot);
+            }];
+        }
+    }
+    if (i == 3 && nt && [nt nvi]->w == 128 && [nt nvi]->h == 128 &&
+        [nt nvi]->bpp == 4 && _ps && vmtl_icon_trace_diag() &&
+        vmtl_ps_fragment_hash(_ps) == 0x397298c5) {
+        static _Atomic unsigned iconUses;
+        const uint32_t slot = atomic_fetch_add(&iconUses, 1);
+        if (slot < 64) {
+            VMTLTexture *used = nt;
+            VMTLTexture *target = self->_target;
+            VMTLTexture *targetRoot = target ? (target->_parent ? target->_parent : target) : nil;
+            _cb->_c.icon_view = [used nvview];
+            _cb->_c.icon_binding = (uint32_t)i;
+            _cb->_c.icon_seq = slot;
+            vmtl_icon_log("ICONPASS slot %u enc %p target %p size %ux%u surf %u view %p imageView %p ownView %p",
+                  slot, (__bridge void *)self, (__bridge void *)target,
+                  target ? [target nvi]->w : 0, target ? [target nvi]->h : 0,
+                  targetRoot && targetRoot->_surf ? (unsigned)IOSurfaceGetID(targetRoot->_surf) : 0,
+                  [used nvview], [used nvi]->view, used->_ownView);
+            vmtl_icon_log("ICONUSE encode slot %u tex %p img %p cb %p target %p placed %d/%d heap %p/%p off %lu back %p/%lu tiled %d parent %p/%p surf %p usage %#x", slot,
+                  (__bridge void *)used, [used nvi], (__bridge void *)_cb, (__bridge void *)self->_target,
+                  [used nvi]->placed, used->_subPlaced, (__bridge void *)used->_heap, (__bridge void *)used->_subHeap,
+                  (unsigned long)used->_heapOffset, (__bridge void *)used->_backBuf, (unsigned long)used->_backOff,
+                  used->_tiledCopy, (__bridge void *)used->_parent, (__bridge void *)used->_viewParent,
+                  (void *)used->_surf, [used nvi]->usage);
+            [_cb addScheduledHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_icon_log("ICONUSE scheduled slot %u tex %p cb %p", slot, (__bridge void *)used, (__bridge void *)cb);
+            }];
+            [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_icon_log("ICONUSE completed slot %u tex %p cb %p status %ld", slot,
+                      (__bridge void *)used, (__bridge void *)cb, (long)cb.status);
+            }];
+        } else {
+            _cb->_c.icon_view = NULL;
+        }
+    }
     { VMTLTexture *rt = nt->_parent ? nt->_parent : nt; nvtrace("FTEX[%lu] %ux%u surf %u view %d", (unsigned long)i, [nt nvi]->w, [nt nvi]->h,
         rt->_surf ? (unsigned)IOSurfaceGetID(rt->_surf) : 0u, nt->_parent != nil); }
     if (nt->_tbView) vmtl_vk_bind_texel_view(&_cb->_c, VMTL_SET_FRAGMENT, (uint32_t)i, nt->_tbView, nt->_tbStorage);
@@ -2739,17 +3456,364 @@ static VMTLBuffer *vmtl_bytes_ring(VMTLCommandBuffer *cb, NSUInteger len, size_t
     if (vmtl_vk_bind_texture_view(&_cb->_c, VMTL_SET_FRAGMENT, (uint32_t)i, [nt nvview])) nvlog("setFragmentTexture: bind FAILED");
     vmtl_vk_bind_storage_view(&_cb->_c, VMTL_SET_FRAGMENT, (uint32_t)i, nt->_stex ? [nt nvview] : NULL);
     }
+    if (!nt->_tbView && vmtl_trace_on()) {
+        extern uint32_t vmtl_bl_slot(void *);
+        VMTLTexture *rt = nt->_parent ? nt->_parent : nt;
+        IOSurfaceRef s = rt->_surf;
+        const NSUInteger plane = rt->_plane;
+        nvtrace("FTEXD[%lu] fmt %lu plane %lu row %lu bpe %lu bl %u vram %d synced %d seed %u/%u",
+                (unsigned long)i, (unsigned long)[nt pixelFormat], (unsigned long)plane,
+                (unsigned long)(s ? IOSurfaceGetBytesPerRowOfPlane(s, (uint32_t)plane) : 0),
+                (unsigned long)(s ? IOSurfaceGetBytesPerElementOfPlane(s, (uint32_t)plane) : 0),
+                vmtl_bl_slot([nt nvview]), rt->_vramOn, rt->_surfSynced,
+                rt->_surfSeed, s ? IOSurfaceGetSeed(s) : 0);
+    }
 }
+static BOOL vmtl_wallpaper_ycbcr_pipeline(VMTLRenderPipelineState *ps)
+{
+    return vmtl_ps_fragment_hash(ps) == 0x70415cd3;
+}
+static BOOL vmtl_skip_overlay_pipeline(VMTLRenderPipelineState *ps)
+{
+    return !access("/tmp/vmtl-skip-overlay-request", F_OK) &&
+           vmtl_ps_fragment_hash(ps) == 0x7cf3e68d;
+}
+static BOOL vmtl_skip_uber_pipeline(VMTLRenderPipelineState *ps)
+{
+    return !access("/tmp/vmtl-skip-uber-request", F_OK) &&
+           vmtl_ps_fragment_hash(ps) == 0xf4f2a653;
+}
+
+/* Diagnostic only: split a Dock render pass around its YCbCr and overlay draws.
+   Each copy is read back after command-buffer completion; the next draw reopens
+   the pass with Load so the original contents remain intact. */
+static void vmtl_draw_boundary_snapshot(VMTLRenderCommandEncoder *enc, BOOL post)
+{
+    if ((access("/tmp/vmtl-draw-boundary-request", F_OK) &&
+         access("/var/tmp/vmtl-draw-boundary-no-planes", F_OK)) ||
+        !enc->_ps || !enc->_hasSC) return;
+    const uint32_t fs = vmtl_ps_fragment_hash(enc->_ps);
+    const BOOL yuv = fs == 0x70415cd3 || fs == 0x397298c5, overlay = fs == 0x7cf3e68d;
+    if (!yuv && !overlay) return;
+    const uint64_t sy = enc->_sc[1], sw = enc->_sc[2], sh = enc->_sc[3];
+    if (sw != 17 || sh != 1 || sy >= 736 || sy + sh <= 640) return;
+    VMTLTexture *src = enc->_target;
+    VMTLTexture *root = src && src->_parent ? src->_parent : src;
+    nvk_image *si = root ? [root nvi] : NULL;
+    if (!root || !root->_surf || !si || si->w != 1280 || si->h != 800 || si->bpp != 4 ||
+        root->_baseLevel || root->_baseSlice) return;
+    static _Atomic unsigned next;
+    const unsigned seq = atomic_fetch_add(&next, 1);
+    if (seq >= 384) return;
+    enc->_cb->_c.matrix_seq = post ? 0 : seq + 1;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat
+                                                                                  width:1280 height:96 mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModePrivate;
+    VMTLTexture *copy = (VMTLTexture *)[[enc device] newTextureWithDescriptor:d];
+    if (!copy) { nvlog("BSNAP %u allocation FAILED", seq); return; }
+    if (![enc vmtlEnsurePass:enc->_ps]) return;
+    if (enc->_cb->_c.in_rp) vmtl_vk_cmd_end_render(&enc->_cb->_c);
+    enc->_pass.load = VMTL_LOAD_ALL;
+    if (yuv && !post) {
+        NSArray *binding = enc->_fbufAt[@3];
+        VMTLBuffer *b = binding ? binding[0] : nil;
+        const NSUInteger off = binding ? [binding[1] unsignedLongValue] : 0;
+        void *actualSet = NULL;
+        nvk_setref actual = {0};
+        vmtl_vk_diag_matrix_set(&enc->_cb->_c, &actualSet, &actual);
+        nvk_buffer source = b ? b->_b : (nvk_buffer){0};
+        size_t sourceOff = off;
+        unsigned stableSource = 0;
+        if (actualSet && actual.b3write && !actual.b3dummy && actual.b3 && actual.b3off <= SIZE_MAX - 48) {
+            source = (nvk_buffer){ .buf = actual.b3, .size = actual.b3off + 48 };
+            sourceOff = actual.b3off;
+            stableSource = 1;
+        }
+        nvk_buffer rb = {0};
+        if (b && b->_b.size == 262144 && off <= b->_b.size && b->_b.size - off >= 48 &&
+            !vmtl_vk_buffer_create(48, 1, &rb) && rb.map &&
+            !vmtl_vk_cmd_copy_buffer(&enc->_cb->_c, &source, sourceOff, &rb, 0, 48)) {
+            const float *expected = (const float *)((const unsigned char *)vmtl_buf_cpu(b) + off);
+            if (actualSet) {
+                const float *base = (const float *)vmtl_buf_cpu(b);
+                nvlog("MBSET seq %u fs %08x set %p current %p/%lu recorded %p/%lu "
+                      "range %llu write %u dummy %u base %.9g %.9g %.9g %.9g", seq, fs,
+                      actualSet, b->_b.buf, (unsigned long)off, actual.b3,
+                      (unsigned long)actual.b3off, (unsigned long long)actual.b3range,
+                      actual.b3write, actual.b3dummy, base[0], base[1], base[2], base[3]);
+            }
+            nvlog("MBPRE seq %u off %lu CPU %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g",
+                  seq, (unsigned long)off, expected[0], expected[1], expected[2], expected[3],
+                  expected[4], expected[5], expected[6], expected[7], expected[8], expected[9],
+                  expected[10], expected[11]);
+            [enc->_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                const float *f = (const float *)rb.map;
+                nvlog("MBPRE seq %u GPU %s %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g",
+                      seq, stableSource ? "stable" : "original", f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+                      f[8], f[9], f[10], f[11]);
+                vmtl_vk_buffer_destroy(&rb);
+            }];
+        } else if (rb.buf) vmtl_vk_buffer_destroy(&rb);
+    }
+    if (vmtl_vk_cmd_copy_image_sub(&enc->_cb->_c, si, root->_baseLevel, root->_baseSlice,
+                                   0, 640, [copy nvi], 0, 0, 0, 0, 1280, 96)) {
+        nvlog("BSNAP %u copy FAILED", seq); return;
+    }
+    if (!enc->_cb->_scratch) enc->_cb->_scratch = [NSMutableArray new];
+    [enc->_cb->_scratch addObject:copy];
+    const unsigned sid = (unsigned)IOSurfaceGetID(root->_surf);
+    const unsigned kind = (yuv ? 0 : 2) + (post ? 1 : 0);
+    if (yuv && post && seq < 64 && access("/var/tmp/vmtl-draw-boundary-no-planes", F_OK)) {
+        VMTLTexture *planes[2] = { enc->_diagPlane0, enc->_diagPlane1 };
+        for (unsigned k = 0; k < 2; k++) {
+            VMTLTexture *snap = planes[k];
+            if (!snap) continue;
+            nvtrace("BPLANE seq %u cb %p enc %p plane %u surf %u", seq,
+                    (__bridge void *)enc->_cb, (__bridge void *)enc, k, vmtl_surf_id(snap));
+            vmtl_plane_cpu_seq_dump(snap, seq);
+            [enc->_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_plane_gpu_seq_dump(snap, seq);
+            }];
+        }
+    }
+    nvtrace("BSNAP seq %u cb %p enc %p surf %u kind %u fs %08x sc %u,%u %ux%u",
+            seq, (__bridge void *)enc->_cb, (__bridge void *)enc, sid, kind, fs,
+            enc->_sc[0], enc->_sc[1], enc->_sc[2], enc->_sc[3]);
+    [enc->_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        const size_t row = 1280 * 4, bytes = row * 96;
+        void *px = malloc(bytes);
+        if (!px) { nvlog("BSNAP %u readback malloc FAILED", seq); return; }
+        int rc = vmtl_vk_image_read_region_level(copy->_q, [copy nvi], px, row,
+                                                 0, 0, 1280, 96, 0);
+        if (rc) { nvlog("BSNAP %u readback FAILED rc %d", seq, rc); free(px); return; }
+        char path[192], tmp[208];
+        snprintf(path, sizeof path, "/tmp/vmtl-boundary-%d-%03u-k%u-surf%u.bgra",
+                 (int)getpid(), seq, kind, sid);
+        snprintf(tmp, sizeof tmp, "%s.tmp", path);
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        uint32_t hdr[4] = { 0x3146564e, 1280, 96, (uint32_t)row };
+        int ok = fd >= 0 && write(fd, hdr, sizeof hdr) == (ssize_t)sizeof hdr &&
+                 write(fd, px, bytes) == (ssize_t)bytes;
+        if (fd >= 0) close(fd);
+        if (ok && rename(tmp, path) == 0) nvtrace("BWRITE seq %u kind %u", seq, kind);
+        else { unlink(tmp); nvlog("BSNAP %u write FAILED errno %d", seq, errno); }
+        free(px);
+    }];
+    if (!post && ![enc vmtlEnsurePass:enc->_ps])
+        nvlog("BSNAP %u could not reopen the pre-draw pass", seq);
+}
+enum {
+    VMTL_MATRIX_SNAP_BYTES = 48,
+    VMTL_TRANSFER_SNAP_BYTES = 224,
+    VMTL_DRAW_SNAP_BYTES = VMTL_MATRIX_SNAP_BYTES + VMTL_TRANSFER_SNAP_BYTES
+};
+
+static void vmtl_transfer_values(const char *tag, VMTLCommandBuffer *cb,
+                                 VMTLRenderCommandEncoder *enc, uint32_t draw,
+                                 const unsigned char *bytes)
+{
+    const float *f = (const float *)bytes;
+    for (uint32_t vec = 0; vec < 14; vec++, f += 4)
+        nvtrace("%s cb %p enc %p draw %u vec %u %.9g %.9g %.9g %.9g",
+                tag, (__bridge void *)cb, (__bridge void *)enc, draw, vec,
+                f[0], f[1], f[2], f[3]);
+}
+
+static void vmtl_matrix_record(VMTLRenderCommandEncoder *enc)
+{
+    if ((access("/tmp/vmtl-fb-readback-request", F_OK) && !vmtl_boot_diag()) || !enc->_ps ||
+        !vmtl_wallpaper_ycbcr_pipeline(enc->_ps) || enc->_snapMBCount >= 16) return;
+    NSArray *matrixBinding = enc->_fbufAt[@3], *transferBinding = enc->_fbufAt[@4];
+    VMTLBuffer *b = matrixBinding ? matrixBinding[0] : nil;
+    VMTLBuffer *tb = transferBinding ? transferBinding[0] : nil;
+    const NSUInteger matrixOff = matrixBinding ? [matrixBinding[1] unsignedLongValue] : 0;
+    const NSUInteger transferOff = transferBinding ? [transferBinding[1] unsignedLongValue] : 0;
+    if (!b || tb != b || b->_b.size != 262144 || (enc->_snapMB && enc->_snapMB != b) ||
+        matrixOff > b->_b.size || b->_b.size - matrixOff < VMTL_MATRIX_SNAP_BYTES ||
+        transferOff > b->_b.size || b->_b.size - transferOff < VMTL_TRANSFER_SNAP_BYTES) return;
+    const void *map = vmtl_buf_cpu(b);
+    if (!map) return;
+    const uint32_t slot = enc->_snapMBCount++;
+    enc->_snapMB = b;
+    enc->_snapMBOff[slot][0] = matrixOff;
+    enc->_snapMBOff[slot][1] = transferOff;
+    memcpy(enc->_snapMBExpected[slot], (const unsigned char *)map + matrixOff,
+           VMTL_MATRIX_SNAP_BYTES);
+    memcpy(enc->_snapMBExpected[slot] + VMTL_MATRIX_SNAP_BYTES,
+           (const unsigned char *)map + transferOff, VMTL_TRANSFER_SNAP_BYTES);
+    nvtrace("FBR cb %p enc %p draw %u buf %p off %lu transfer_off %lu",
+            (__bridge void *)enc->_cb, (__bridge void *)enc, slot, b,
+            (unsigned long)matrixOff, (unsigned long)transferOff);
+    char sampler[512];
+    vmtl_vk_trace_sampler(&enc->_cb->_c, VMTL_SET_FRAGMENT, 0, sampler, sizeof sampler);
+    nvtrace("FSAMP cb %p enc %p draw %u %s", (__bridge void *)enc->_cb,
+            (__bridge void *)enc, slot, sampler);
+    vmtl_transfer_values("FBC4", enc->_cb, enc, slot,
+                         enc->_snapMBExpected[slot] + VMTL_MATRIX_SNAP_BYTES);
+}
+
+static void vmtl_matrix_snapshot(VMTLRenderCommandEncoder *enc)
+{
+    if (!enc->_snapMBCount || (access("/tmp/vmtl-fb-readback-request", F_OK) && !vmtl_boot_diag())) return;
+    const uint32_t n = enc->_snapMBCount;
+    nvk_buffer rb;
+    if (vmtl_vk_buffer_create((size_t)n * VMTL_DRAW_SNAP_BYTES, 1, &rb) || !rb.map) {
+        nvlog("FBG allocation FAILED"); return;
+    }
+    NSMutableData *expected = [NSMutableData dataWithBytes:enc->_snapMBExpected
+                                                    length:(NSUInteger)n * VMTL_DRAW_SNAP_BYTES];
+    for (uint32_t i = 0; i < n; i++) {
+        const NSUInteger matrixOff = enc->_snapMBOff[i][0];
+        const NSUInteger transferOff = enc->_snapMBOff[i][1];
+        const size_t dst = (size_t)i * VMTL_DRAW_SNAP_BYTES;
+        if (vmtl_vk_cmd_copy_buffer(&enc->_cb->_c, &enc->_snapMB->_b, matrixOff,
+                                    &rb, dst, VMTL_MATRIX_SNAP_BYTES) ||
+            vmtl_vk_cmd_copy_buffer(&enc->_cb->_c, &enc->_snapMB->_b, transferOff,
+                                    &rb, dst + VMTL_MATRIX_SNAP_BYTES, VMTL_TRANSFER_SNAP_BYTES)) {
+            nvlog("FBG copy FAILED at draw %u offs %lu/%lu", i,
+                  (unsigned long)matrixOff, (unsigned long)transferOff);
+            vmtl_vk_buffer_destroy(&rb); return;
+        }
+    }
+    nvtrace("FBGSNAP cb %p enc %p draws %u", (__bridge void *)enc->_cb,
+            (__bridge void *)enc, n);
+    [enc->_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        const unsigned char *gpu = rb.map, *cpu = expected.bytes;
+        unsigned bad = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const NSUInteger matrixOff = enc->_snapMBOff[i][0];
+            const NSUInteger transferOff = enc->_snapMBOff[i][1];
+            const size_t at = (size_t)i * VMTL_DRAW_SNAP_BYTES;
+            const int different = memcmp(cpu + at, gpu + at, VMTL_MATRIX_SNAP_BYTES) != 0;
+            const int transferDifferent = memcmp(cpu + at + VMTL_MATRIX_SNAP_BYTES,
+                gpu + at + VMTL_MATRIX_SNAP_BYTES, VMTL_TRANSFER_SNAP_BYTES) != 0;
+            bad += different || transferDifferent;
+            nvtrace("FBG cb %p enc %p draw %u off %lu different %d transfer_off %lu transfer_different %d",
+                    (__bridge void *)cb, (__bridge void *)enc, i, (unsigned long)matrixOff,
+                    different, (unsigned long)transferOff, transferDifferent);
+            if (different) {
+                const float *cf = (const float *)(cpu + at);
+                const float *gf = (const float *)(gpu + at);
+                nvtrace("FBG-CPU %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g",
+                        cf[0], cf[1], cf[2], cf[3], cf[4], cf[5], cf[6], cf[7], cf[8], cf[9], cf[10], cf[11]);
+                nvtrace("FBG-GPU %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g | %.9g %.9g %.9g %.9g",
+                        gf[0], gf[1], gf[2], gf[3], gf[4], gf[5], gf[6], gf[7], gf[8], gf[9], gf[10], gf[11]);
+            }
+            if (transferDifferent)
+                vmtl_transfer_values("FBG4", (VMTLCommandBuffer *)cb, enc, i,
+                                     gpu + at + VMTL_MATRIX_SNAP_BYTES);
+        }
+        nvtrace("FBGDONE cb %p enc %p draws %u mismatches %u",
+                (__bridge void *)cb, (__bridge void *)enc, n, bad);
+        nvk_buffer done = rb; vmtl_vk_buffer_destroy(&done);
+    }];
+}
+
+static BOOL vmtl_trace_copy610(VMTLRenderPipelineState *ps) {
+    if (!vmtl_trace_on()) return NO;
+    VMTLFunction *ff = (VMTLFunction *)ps->_descriptor.fragmentFunction;
+    if (![ff isKindOfClass:[VMTLFunction class]]) return NO;
+    NSData *d = ff->_spirv;
+    if (d.length != 585412) return NO;
+    const uint8_t *b = d.bytes; uint32_t h = 2166136261u;
+    for (NSUInteger k = 0; k < d.length; k++) { h ^= b[k]; h *= 16777619u; }
+    return h == 0x610ea956;
+}
+static void vmtl_trace_copy610_geometry(VMTLRenderCommandEncoder *enc, VMTLBuffer *ib,
+                                        NSUInteger off, NSUInteger count, MTLIndexType it,
+                                        NSInteger baseVertex) {
+    const BOOL copy610 = vmtl_trace_copy610(enc->_ps);
+    const BOOL geometry = !access("/tmp/vmtl-trace-geometry", F_OK) && enc->_ps &&
+                          [enc->_ps->_vname rangeOfString:@"fixed_vert"].location != NSNotFound;
+    const BOOL vbread = !access("/tmp/vmtl-vb-readback-request", F_OK);
+    if (!copy610 && !geometry && !vbread) return;
+    const void *imap = ib->_shadow.map ? ib->_shadow.map : ib->_b.map;
+    size_t isz = it == MTLIndexTypeUInt32 ? 4 : 2;
+    if (!imap || off > ib->_b.size || count > (ib->_b.size - off) / isz) return;
+    NSUInteger n = count < 6 ? count : 6;
+    uint32_t ix[6];
+    char list[160]; int len = 0;
+    for (NSUInteger k = 0; k < n; k++) {
+        ix[k] = it == MTLIndexTypeUInt32 ? ((const uint32_t *)((const char *)imap + off))[k]
+                                         : ((const uint16_t *)((const char *)imap + off))[k];
+        len += snprintf(list + len, sizeof list - (size_t)len, "%s%u", k ? "," : "", ix[k]);
+    }
+    nvtrace("COPYI count %lu indices %s baseVertex %ld", (unsigned long)count, list, (long)baseVertex);
+    NSArray *binding = enc->_vbufAt[@1];
+    VMTLBuffer *vb = binding ? binding[0] : nil;
+    NSUInteger voff = binding ? [binding[1] unsignedLongValue] : 0;
+    if (count == 6 && vb && vbread && enc->_ps &&
+        [enc->_ps->_vname rangeOfString:@"fixed_vert"].location != NSNotFound &&
+        enc->_snapVBCount < 8 && (enc->_snapVB == vb || !enc->_snapVB)) {
+        enc->_snapVB = vb;
+        enc->_snapVBOff[enc->_snapVBCount++] = voff;
+    }
+    const void *vmap = vb ? (vb->_shadow.map ? vb->_shadow.map : vb->_b.map) : NULL;
+    if (!vmap) return;
+    for (NSUInteger k = 0; k < n; k++) {
+        BOOL seen = NO; for (NSUInteger j = 0; j < k; j++) if (ix[j] == ix[k]) seen = YES;
+        if (seen) continue;
+        int64_t vi = (int64_t)ix[k] + baseVertex;
+        if (vi < 0 || voff > vb->_b.size || (uint64_t)vi > (vb->_b.size - voff) / 48 ||
+            voff + (uint64_t)vi * 48 > vb->_b.size - 40) continue;
+        const float *f = (const float *)((const char *)vmap + voff + (uint64_t)vi * 48);
+        const uint32_t *w = (const uint32_t *)f;
+        nvtrace("COPYV %lld p %.6g %.6g %.6g %.6g uv0 %.6g %.6g uv1 %.6g %.6g c %08x",
+                (long long)vi, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], w[8]);
+    }
+}
+static void vmtl_vertex_snapshot(VMTLRenderCommandEncoder *enc)
+{
+    if (!enc->_snapVBCount || access("/tmp/vmtl-vb-readback-request", F_OK)) return;
+    const uint32_t n = enc->_snapVBCount;
+    nvk_buffer rb;
+    if (vmtl_vk_buffer_create((size_t)n * 192, 1, &rb) || !rb.map) {
+        nvlog("VBG allocation FAILED"); return;
+    }
+    NSMutableArray *offsets = [NSMutableArray arrayWithCapacity:n];
+    for (uint32_t i = 0; i < n; i++) {
+        const NSUInteger off = enc->_snapVBOff[i];
+        [offsets addObject:@(off)];
+        if (vmtl_vk_cmd_copy_buffer(&enc->_cb->_c, &enc->_snapVB->_b, off,
+                                    &rb, (size_t)i * 192, 192)) {
+            nvlog("VBG copy FAILED at %lu", (unsigned long)off);
+            vmtl_vk_buffer_destroy(&rb); return;
+        }
+    }
+    nvtrace("VBGSNAP cb %p enc %p draws %u", (__bridge void *)enc->_cb,
+            (__bridge void *)enc, n);
+    [enc->_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        const unsigned char *base = rb.map;
+        for (uint32_t i = 0; i < n; i++) {
+            const NSUInteger off = [offsets[i] unsignedLongValue];
+            const float *f = (const float *)(base + (size_t)i * 192);
+            const uint32_t *w = (const uint32_t *)f;
+            for (uint32_t v = 0; v < 4; v++, f += 12, w += 12)
+                nvtrace("VBG cb %p enc %p draw %u off %lu v %u p %.9g %.9g %.9g %.9g uv0 %.9g %.9g uv1 %.9g %.9g c %08x",
+                        (__bridge void *)cb, (__bridge void *)enc, i,
+                        (unsigned long)off, v, f[0], f[1], f[2], f[3],
+                        f[4], f[5], f[6], f[7], w[8]);
+        }
+        nvk_buffer done = rb; vmtl_vk_buffer_destroy(&done);
+    }];
+}
+
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
          instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)baseInstance {
     if (!_begun) { nvlog("encoder: draw with no pipeline set"); return; }
     if (![self vmtlBindSamplerPipeline]) return;
     nvtrace("DRAW type %u | vs %s | fs %s | blend %s", (unsigned)type, _ps ? _ps->_vname.UTF8String : "-", _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
+    if (vmtl_skip_overlay_pipeline(_ps)) { nvtrace("SKIP overlay diagnostic"); return; }
+    if (vmtl_skip_uber_pipeline(_ps)) { nvtrace("SKIP Uber diagnostic"); return; }
+    vmtl_draw_boundary_snapshot(self, NO);
     if (vmtl_trace_on()) { char bufs_[600]; vmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_); nvtrace("  BUFS%s", bufs_); }
     if (vmtl_vk_cmd_set_topology(&_cb->_c, (unsigned)type)) return;
     if ([self vmtlVertexInputs]) return;
+    vmtl_matrix_record(self);
     nvtrace("  direct start %lu count %lu instances %lu", (unsigned long)start, (unsigned long)count, (unsigned long)instances);
     vmtl_vk_cmd_draw(&_cb->_c, (uint32_t)start, (uint32_t)count, (uint32_t)instances, (uint32_t)baseInstance);
+    vmtl_draw_boundary_snapshot(self, YES);
 }
 - (int)vmtlVertexInputs {
     if (_ps && _ps->_p.tess) { static int said; if (said++ < 8) nvlog("tess: a primitive draw on a tessellation pipeline (%s) — NOT drawn "
@@ -2849,7 +3913,7 @@ static VMTLBuffer *vmtl_bytes_ring(VMTLCommandBuffer *cb, NSUInteger len, size_t
     _visPending = NO;
 }
 - (void)vmtlBeginVisibility {
-    if (!_visPending || !_begun) return;
+    if (!_visPending || !_begun || !_cb->_c.in_rp) return;
     uint32_t query;
     if (vmtl_vk_cmd_alloc_occlusion(&_cb->_c, &query) ||
         vmtl_vk_cmd_begin_occlusion(&_cb->_c, query)) {
@@ -2870,8 +3934,12 @@ static VMTLBuffer *vmtl_bytes_ring(VMTLCommandBuffer *cb, NSUInteger len, size_t
 }
 - (void)endEncoding {
     _cb->_nEnd++;
+    if (_begun && ![self vmtlEnsurePass:_ps]) { _refused = YES; return; }
     [self vmtlCloseVisibility];
-    if (_begun) vmtl_vk_cmd_end_render(&_cb->_c);
+    if (_cb->_c.in_rp) vmtl_vk_cmd_end_render(&_cb->_c);
+    vmtl_matrix_snapshot(self);
+    vmtl_vertex_snapshot(self);
+    vmtl_pass_snapshot(self);
     NSMutableDictionary *groups = [NSMutableDictionary new];
     BOOL needScratch = NO;
     for (NSArray *record in _visRecords) {
@@ -3001,12 +4069,18 @@ static VMTLBuffer *vmtl_bytes_ring(VMTLCommandBuffer *cb, NSUInteger len, size_t
     vmtl_retain_resource(_cb, b);
     if (![self vmtlBindSamplerPipeline]) return;
     nvtrace("DRAW type %u | vs %s | fs %s | blend %s", (unsigned)type, _ps ? _ps->_vname.UTF8String : "-", _ps ? _ps->_fname.UTF8String : "-", _ps ? _ps->_blend.UTF8String : "-");
+    if (vmtl_skip_overlay_pipeline(_ps)) { nvtrace("SKIP overlay diagnostic"); return; }
+    if (vmtl_skip_uber_pipeline(_ps)) { nvtrace("SKIP Uber diagnostic"); return; }
+    vmtl_draw_boundary_snapshot(self, NO);
     if (vmtl_trace_on()) { char bufs_[600]; vmtl_vk_trace_buffers(&_cb->_c, bufs_, sizeof bufs_); nvtrace("  BUFS%s", bufs_); }
     if (vmtl_vk_cmd_set_topology(&_cb->_c, (unsigned)type)) return;
     if ([self vmtlVertexInputs]) return;
+    vmtl_matrix_record(self);
     nvtrace("  indexed count %lu u32 %d off %lu instances %lu baseVertex %ld", (unsigned long)count, it == MTLIndexTypeUInt32, (unsigned long)off, (unsigned long)instances, (long)baseVertex);
+    vmtl_trace_copy610_geometry(self, b, off, count, it, baseVertex);
     vmtl_vk_cmd_draw_indexed(&_cb->_c, &b->_b, off, (uint32_t)count, it == MTLIndexTypeUInt32,
                               (uint32_t)instances, (int32_t)baseVertex, (uint32_t)baseInstance);
+    vmtl_draw_boundary_snapshot(self, YES);
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)it
                   indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)off instanceCount:(NSUInteger)i {
@@ -3051,7 +4125,18 @@ static VMTLBuffer *vmtl_bytes_ring(VMTLCommandBuffer *cb, NSUInteger len, size_t
     [self setVertexBytes:b length:l atIndex:i]; [self vmtlVertexStride:st atIndex:i]; }
 - (void)setFragmentBufferOffset:(NSUInteger)off atIndex:(NSUInteger)i {
     nvtrace("FBOFF[%lu] -> %lu", (unsigned long)i, (unsigned long)off);
-    { NSArray *b = _fbufAt[@(i)]; if (b) _fbufAt[@(i)] = @[b[0], @(off)]; }
+    { NSArray *b = _fbufAt[@(i)]; if (b) {
+        _fbufAt[@(i)] = @[b[0], @(off)];
+        VMTLBuffer *nb = b[0];
+        if (i == 3 && nb->_b.size == 262144) {
+            nvtrace_floats("FBOFFD", (unsigned long)i, (unsigned long)off,
+                           nb->_b.map ? nb->_b.map : nb->_shadow.map, 16);
+            if (vmtl_trace_on())
+                nvtrace("FBOFFCTX[%lu] buf %p cb %p enc %p dirty %lu..%lu z %d",
+                        (unsigned long)i, nb, _cb, self,
+                        (unsigned long)nb->_dirtyLo, (unsigned long)nb->_dirtyHi, nb->_zshadow);
+        }
+    } }
     if (vmtl_vk_bind_buffer_offset(&_cb->_c, VMTL_SET_FRAGMENT, (uint32_t)i, off))
         nvlog("setFragmentBufferOffset: nothing bound at fragment index %lu", (unsigned long)i);
 }
@@ -3490,6 +4575,10 @@ void vmtl_heap_back(VMTLHeap *h, NSUInteger size, int shared) {
     _used += len;
     atomic_fetch_add(&gHAPlaced, 1); atomic_fetch_add(&gHALive, len);
     atomic_fetch_add(rec ? &gHTRecycled : &gHTPlaced, 1); vmtl_heaptex_census(rec ? "recycled" : "placed");
+    if (vmtl_icon_trace_diag() && w == 128 && hh == 128)
+        vmtl_icon_log("ICONCREATE heap tex %p img %p heap %p off %lu charge %lu recycled %d usage %#x",
+              (__bridge void *)t, [t nvi], (__bridge void *)self, (unsigned long)off,
+              (unsigned long)len, rec, t->_i.usage);
     return t;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
@@ -3922,7 +5011,10 @@ static void vmtl_stride_dropped(NSUInteger st) { static BOOL said; if (!said && 
         _e78VarFor = _ps; _e78VarSel = selected;
     }
     vmtl_retain_resource(_cb, selected);
+    VMTLCommandBuffer *surfacePrev = vmtl_surface_cmd;
+    vmtl_surface_cmd = _cb;
     vmtl_bind_embedded(_cb, VMTL_SET_VERTEX, _ps->_function, _bufAt);
+    vmtl_surface_cmd = surfacePrev;
     return selected;
 }
 static int vmtl_zprobe_on(void);
@@ -4063,7 +5155,7 @@ static void vmtl_zprobe_drain(void) {
     if (!nt) { nvlog("compute setTexture: nil at %lu", (unsigned long)i); return; }
     vmtl_zprobe_record(nt, _ps && _ps->_function ? _ps->_function->_fname.UTF8String : NULL, (unsigned)i, nt->_stex ? 1u : 0u);
     vmtl_retain_resource(_cb, nt);
-    [nt vmtlSurfaceIn]; if (nt->_stex) vmtl_surf_dirty(_cb, nt);
+    [nt vmtlSurfaceInCmd:_cb]; if (nt->_stex) vmtl_surf_dirty(_cb, nt);
     if (nt->_tbView) vmtl_vk_bind_texel_view(&_cb->_c, VMTL_SET_VERTEX, (uint32_t)i, nt->_tbView, nt->_tbStorage);
     else {
     if (vmtl_vk_cmd_prepare_sampled_image(&_cb->_c, [nt nvi], nt->_stex)) { nvlog("compute setTexture: image layout preparation refused"); return; }
@@ -4237,6 +5329,25 @@ static NSUInteger vmtl_texture_slice_count(VMTLTexture *t) {
        destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dof {
     VMTLTexture *s = (VMTLTexture *)src, *d = (VMTLTexture *)dst;
     if (!s || !d) { nvlog("blit copyFromTexture: nil"); return; }
+    if (vmtl_icon_trace_diag() && [s nvi]->bpp == 4 && [d nvi]->bpp == 4 &&
+        (([s nvi]->w == 128 && [s nvi]->h == 128) || ([d nvi]->w == 128 && [d nvi]->h == 128))) {
+        static _Atomic unsigned iconCopies;
+        const unsigned slot = atomic_fetch_add(&iconCopies, 1);
+        if (slot < 64) {
+            vmtl_icon_log("ICONCOPY encode slot %u src %p/%ux%u dst %p/%ux%u cb %p region %lux%lu",
+                  slot, (__bridge void *)s, [s nvi]->w, [s nvi]->h,
+                  (__bridge void *)d, [d nvi]->w, [d nvi]->h, (__bridge void *)_cb,
+                  (unsigned long)size.width, (unsigned long)size.height);
+            [_cb addScheduledHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_icon_log("ICONCOPY scheduled slot %u src %p dst %p cb %p", slot,
+                      (__bridge void *)s, (__bridge void *)d, (__bridge void *)cb);
+            }];
+            [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_icon_log("ICONCOPY completed slot %u src %p dst %p cb %p status %ld", slot,
+                      (__bridge void *)s, (__bridge void *)d, (__bridge void *)cb, (long)cb.status);
+            }];
+        }
+    }
     if (sl >= s.mipmapLevelCount || dl >= d.mipmapLevelCount || ss >= vmtl_texture_slice_count(s) || ds >= vmtl_texture_slice_count(d)) {
         nvlog("blit copyFromTexture: subresource outside view"); return;
     }
@@ -4247,7 +5358,7 @@ static NSUInteger vmtl_texture_slice_count(VMTLTexture *t) {
       nvtrace("BLIT tex %ux%u surf %u (%lu,%lu %lux%lu) -> tex %ux%u surf %u (%lu,%lu)", [s nvi]->w, [s nvi]->h, vmtl_surf_id(s), (unsigned long)so.x,
           (unsigned long)so.y, (unsigned long)size.width, (unsigned long)size.height, [d nvi]->w, [d nvi]->h, vmtl_surf_id(d), (unsigned long)dof.x, (unsigned long)dof.y);
       g_trace_mute = was; }
-    [s vmtlSurfaceIn]; [d vmtlSurfaceIn]; vmtl_surf_dirty(_cb, d);
+    [s vmtlSurfaceInCmd:_cb]; [d vmtlSurfaceInCmd:_cb]; vmtl_surf_dirty(_cb, d);
     if (vmtl_vk_cmd_copy_image_sub(&_cb->_c, [s nvi], (uint32_t)sl + s->_baseLevel, (uint32_t)ss + s->_baseSlice, (uint32_t)so.x, (uint32_t)so.y,
                                 [d nvi], (uint32_t)dl + d->_baseLevel, (uint32_t)ds + d->_baseSlice, (uint32_t)dof.x, (uint32_t)dof.y,
                                 (uint32_t)size.width, (uint32_t)size.height))
@@ -4275,7 +5386,7 @@ static NSUInteger vmtl_texture_slice_count(VMTLTexture *t) {
     if (!_cb->_resources) _cb->_resources = [VMTLResSet new];
     [_cb->_resources addObject:t];
     { int was = nvtrace_scope([t nvi]->w, [t nvi]->h); nvtrace("MIPS tex %ux%u surf %u", [t nvi]->w, [t nvi]->h, vmtl_surf_id(t)); g_trace_mute = was; }
-    [t vmtlSurfaceIn]; vmtl_surf_dirty(_cb, t);
+    [t vmtlSurfaceInCmd:_cb]; vmtl_surf_dirty(_cb, t);
     if (vmtl_vk_cmd_image_gen_mipmaps(&_cb->_c, [t nvi])) nvlog("generateMipmapsForTexture: FAILED");
 }
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)dst
@@ -4335,7 +5446,24 @@ static NSUInteger vmtl_texture_slice_count(VMTLTexture *t) {
         nvtrace("BLIT buf len %lu off %lu row %lu (%lux%lu) -> tex %ux%u surf %u (%lu,%lu) | nonzero %u/%u sampled bytes", (unsigned long)b->_b.size, (unsigned long)so,
             (unsigned long)row, (unsigned long)size.width, (unsigned long)size.height, [t nvi]->w, [t nvi]->h, vmtl_surf_id(t), (unsigned long)dof.x, (unsigned long)dof.y, nz, nn); }
       g_trace_mute = was; }
-    [t vmtlSurfaceIn]; vmtl_surf_dirty(_cb, t);
+    const BOOL iconTrace = vmtl_icon_trace_diag() && [t nvi]->w == 128 && [t nvi]->h == 128 && [t nvi]->bpp == 4;
+    if (iconTrace) {
+        static _Atomic unsigned iconBlits;
+        const unsigned slot = atomic_fetch_add(&iconBlits, 1);
+        if (slot < 64) {
+            vmtl_icon_log("ICONBLIT encode slot %u tex %p img %p cb %p buf %p row %lu off %lu", slot,
+                  (__bridge void *)t, [t nvi], (__bridge void *)_cb, (__bridge void *)b,
+                  (unsigned long)row, (unsigned long)so);
+            [_cb addScheduledHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_icon_log("ICONBLIT scheduled slot %u tex %p cb %p", slot, (__bridge void *)t, (__bridge void *)cb);
+            }];
+            [_cb addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                vmtl_icon_log("ICONBLIT completed slot %u tex %p cb %p status %ld", slot,
+                      (__bridge void *)t, (__bridge void *)cb, (long)cb.status);
+            }];
+        }
+    }
+    [t vmtlSurfaceInCmd:_cb]; vmtl_surf_dirty(_cb, t);
     { BOOL vol = [t nvi]->mtl_type == 7; NSUInteger nz = vol ? (size.depth ? size.depth : 1) : 1; NSUInteger per = img ? img : row * size.height; int rc = 0;
       for (NSUInteger zi = 0; zi < nz && !rc; zi++)
           rc = vmtl_vk_cmd_copy_buffer_to_image_level_layer(&_cb->_c, &b->_b, so + zi * per, (uint32_t)row, [t nvi],
@@ -4366,7 +5494,7 @@ destinationBytesPerImage:(NSUInteger)img {
     { nvk_image *ti = [t nvi]; uint32_t tl = (uint32_t)vmtl_texture_slice_count(t), tm = (uint32_t)t.mipmapLevelCount; BOOL vol = ti->mtl_type == 7;
       if (ss >= tl || sl >= tm || (vol ? (so.z + size.depth > MAX((NSUInteger)1, t.depth >> sl)) : (size.depth != 1 || so.z))) {
           nvlog("blit copyFromTexture:toBuffer: slice %lu/%u level %lu/%u depth %lu@z%lu — outside this texture", (unsigned long)ss, tl, (unsigned long)sl, tm, (unsigned long)size.depth, (unsigned long)so.z); return; } }
-    [t vmtlSurfaceIn];
+    [t vmtlSurfaceInCmd:_cb];
     vmtl_census("copy texture->buffer", [t nvi]->w, [t nvi]->h, t->_surf != NULL);
     { int was = nvtrace_scope([t nvi]->w, [t nvi]->h);
       nvtrace("BLIT tex %ux%u surf %u (%lu,%lu %lux%lu) -> buf len %lu off %lu row %lu", [t nvi]->w, [t nvi]->h, vmtl_surf_id(t), (unsigned long)so.x, (unsigned long)so.y,
@@ -4469,6 +5597,18 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     VMTLRenderCommandEncoder *e = [VMTLRenderCommandEncoder new];
     _nEnc++;
     e->_cb = self; e->_target = (VMTLTexture *)d.colorAttachments[0].texture;
+    if (vmtl_icon_trace_diag() && e->_target && [e->_target nvi]->w == 128 && [e->_target nvi]->h == 128) {
+        VMTLTexture *target = e->_target;
+        vmtl_icon_log("ICONTARGET encode tex %p img %p cb %p", (__bridge void *)target,
+              [target nvi], (__bridge void *)self);
+        [self addScheduledHandler:^(id<MTLCommandBuffer> cb) {
+            vmtl_icon_log("ICONTARGET scheduled tex %p cb %p", (__bridge void *)target, (__bridge void *)cb);
+        }];
+        [self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            vmtl_icon_log("ICONTARGET completed tex %p cb %p status %ld", (__bridge void *)target,
+                  (__bridge void *)cb, (long)cb.status);
+        }];
+    }
     if (!_resources) _resources = [VMTLResSet new];
     if (e->_target) [_resources addObject:e->_target];
     if (d.depthAttachment.texture) [_resources addObject:d.depthAttachment.texture];
@@ -5219,7 +6359,7 @@ static void vmtl_buffer_sync_out(VMTLBuffer *b)
             if (vmtl_vk_copy_buffer(vmtl_device_queue(), &b->_b, 0, &b->_shadow, 0, b->_b.size)) nvlog("commit: managed sync-out of %zu bytes FAILED", b->_b.size); }
         return;
     }
-    if (!b || !b->_hostPtr || !b->_b.map || !b->_hostLen) return;
+    if (!b || !b->_hostPtr || !b->_b.map || !b->_hostLen || b->_hostSyncInOnly) return;
     const uint64_t t0 = vmtl_perf_now();
     memcpy(b->_hostPtr, b->_b.map, b->_hostLen);
     vmtl_perf_note(NVP_SYNCOUT, t0, b->_hostLen);

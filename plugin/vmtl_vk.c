@@ -132,6 +132,61 @@ static int vmtl_vk_vram_wall(uint64_t want, uint64_t *freev_out, uint64_t *bud_o
 static uint64_t g_buf_vram_refused;
 static uint64_t g_heap_vram_refused;
 static uint64_t g_cmd_begun, g_cmd_submitted, g_cmd_abandoned;
+// Experimental image/view retirement grace, disabled after its guest acceptance run regressed
+// the Dock artifacts. VMTL_IMAGE_GRACE=1 opts back in; the default and =0 destroy immediately.
+static int vmtl_image_grace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("VMTL_IMAGE_GRACE");
+        on = e && e[0] && e[0] != '0';
+        nvlog("vk: image/view grace %s (VMTL_IMAGE_GRACE=%s)", on ? "ON" : "OFF", e ? e : "default off");
+    }
+    return on;
+}
+typedef struct vmtl_grace_img { nvk_image img; uint64_t seq; struct vmtl_grace_img *next; } vmtl_grace_img;
+static pthread_mutex_t g_grace_lock = PTHREAD_MUTEX_INITIALIZER;
+static vmtl_grace_img *g_grace_head, *g_grace_tail;
+static uint64_t g_grace_n, g_grace_reaped, g_cmd_finished_seq;
+static void vmtl_vk_image_destroy_now(nvk_image *i);
+static uint64_t vmtl_grace_seq_locked(void)
+{
+    const uint64_t pending = g_cmd_begun > g_cmd_submitted + g_cmd_abandoned ?
+                             g_cmd_begun - g_cmd_submitted - g_cmd_abandoned : 0;
+    return g_cmd_submitted + pending;
+}
+static void vmtl_image_grace_reap(void)
+{
+    vmtl_grace_img *due = NULL, **tail = &due;
+    pthread_mutex_lock(&g_grace_lock);
+    while (g_grace_head && g_grace_head->seq <= g_cmd_finished_seq) {
+        vmtl_grace_img *e = g_grace_head;
+        g_grace_head = e->next;
+        if (!g_grace_head) g_grace_tail = NULL;
+        e->next = NULL; *tail = e; tail = &e->next;
+        g_grace_n--; g_grace_reaped++;
+    }
+    pthread_mutex_unlock(&g_grace_lock);
+    while (due) {
+        vmtl_grace_img *e = due; due = e->next;
+        vmtl_vk_image_destroy_now(&e->img);
+        free(e);
+    }
+}
+static int vmtl_image_grace_held(const nvk_image *image, void *view)
+{
+    if (!vmtl_image_grace_on()) return 0;
+    vmtl_grace_img *e = calloc(1, sizeof *e);
+    if (!e) return 0;
+    if (image) e->img = *image; else e->img.view = view;
+    pthread_mutex_lock(&g_grace_lock);
+    e->seq = vmtl_grace_seq_locked();
+    if (g_grace_tail) g_grace_tail->next = e; else g_grace_head = e;
+    g_grace_tail = e; g_grace_n++;
+    pthread_mutex_unlock(&g_grace_lock);
+    if (image) memset(image, 0, sizeof *image);
+    return 1;
+}
 void vmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned)
 {
     if (begun) *begun = g_cmd_begun; if (submitted) *submitted = g_cmd_submitted; if (abandoned) *abandoned = g_cmd_abandoned;
@@ -570,6 +625,13 @@ static int vmtl_vk_initialize(void)
                 else nvlog("vk: %s: no writable Mesa cache dir (%s) - NAK recompiles every start", getprogname(), dir);
             }
         }
+    }
+    if (!access("/var/tmp/vmtl-vn-sync-submit", F_OK)) {
+        setenv("VN_PERF", "no_async_queue_submit", 1);
+        nvlog("vk: DIAG Venus synchronous queue submit ENABLED (VN_PERF=%s)", getenv("VN_PERF"));
+    } else if (!access("/var/tmp/vmtl-vn-sync-buffer-create", F_OK)) {
+        setenv("VN_PERF", "no_async_buffer_create", 1);
+        nvlog("vk: DIAG Venus synchronous buffer create ENABLED (VN_PERF=%s)", getenv("VN_PERF"));
     }
     g_lib = dlopen(VMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
     if (g_lib) {
@@ -1123,15 +1185,23 @@ int vmtl_vk_buffer_create(size_t size, int host_visible, nvk_buffer *out)
     vmtl_perf_note(r == 0 && out->pool ? NVP_BUFPOOL : NVP_BUFNEW, t0, size);
     return r;
 }
+static _Thread_local int vmtl_buffer_unpooled;
+int vmtl_vk_buffer_create_unpooled(size_t size, int host_visible, nvk_buffer *out)
+{
+    vmtl_buffer_unpooled = 1;
+    const int r = vmtl_vk_buffer_create(size, host_visible, out);
+    vmtl_buffer_unpooled = 0;
+    return r;
+}
 static int vmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer *out)
 {
     if (vmtl_vk_init()) return -1;
     memset(out, 0, sizeof *out); out->size = size;
-    if (host_visible == 2 && size <= VMTL_POOL_MAX && vpool_on() && pool_buffer_create_in(1, size, out) == 0) return 0;
+    if (!vmtl_buffer_unpooled && host_visible == 2 && size <= VMTL_POOL_MAX && vpool_on() && pool_buffer_create_in(1, size, out) == 0) return 0;
     memset(out, 0, sizeof *out); out->size = size;
-    if (host_visible && size <= VMTL_POOL_MAX && pool_buffer_create(size, out) == 0) return 0;
+    if (!vmtl_buffer_unpooled && host_visible && size <= VMTL_POOL_MAX && pool_buffer_create(size, out) == 0) return 0;
     memset(out, 0, sizeof *out); out->size = size;
-    if (bpark_take(size, host_visible, out) == 0) return 0;
+    if (!vmtl_buffer_unpooled && bpark_take(size, host_visible, out) == 0) return 0;
     memset(out, 0, sizeof *out); out->size = size;
     if (!host_visible && size >= (1u << 20) && vmtl_vk_sparse_on() && vmtl_vk_buffer_create_sparse(size, out) == 0) return 0;
     memset(out, 0, sizeof *out); out->size = size;
@@ -1187,6 +1257,12 @@ static int vmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer 
     out->memtype = mt;
     if (!host_visible) vmtl_vk_budget_charge(mr.size);
     VKCK(pvkBindBufferMemory(g_dev, out->buf, out->mem, 0), "vkBindBufferMemory");
+    if (host_visible && pvkGetBufferDeviceAddress) {
+        /* RESOURCE_CREATE_BLOB is a separate Venus control request.  Wait for
+           this reply so it cannot overtake the ring's Allocate/Bind commands. */
+        VkBufferDeviceAddressInfo bai = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, NULL, (VkBuffer)out->buf };
+        (void)pvkGetBufferDeviceAddress(g_dev, &bai);
+    }
     if (host_visible) { VkResult mr_ = pvkMapMemory(g_dev, out->mem, 0, VK_WHOLE_SIZE, 0, &out->map); if (mr_ != VK_SUCCESS) {
         nvlog("vk: vkMapMemory -> %d with %llu buffers live (%llu made, %llu gone), %zu bytes allocated, memory type %d", mr_,
               (unsigned long long)(g_buf_made - g_buf_gone), (unsigned long long)g_buf_made, (unsigned long long)g_buf_gone, g_alloc_bytes, mt);
@@ -1871,7 +1947,10 @@ static int vmtl_dirty_only_on(void)
 typedef struct { vmtl_slot s[2][VMTL_NBIND];
                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
                  uint64_t chg[2][4]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
-                 uint64_t emb_key[2][VMTL_EMB_KEYMAX]; } vmtl_bindtable;
+                 uint64_t emb_key[2][VMTL_EMB_KEYMAX];
+                 /* Samplers a shader brought itself, and the app samplers they displaced. */
+                 uint32_t park_mask[2]; uint8_t park_kind[2][VMTL_NSAMP], park_saved_kind[2][VMTL_NSAMP];
+                 void *park_h[2][VMTL_NSAMP], *park_saved[2][VMTL_NSAMP]; } vmtl_bindtable;
 
 static VkDescriptorSetLayout g_setLayout;
 #define VMTL_MAX_POOLS 64
@@ -1887,6 +1966,7 @@ static VkDescriptorSetLayout g_heapLayout; static VkDescriptorPool g_heapPool; s
 static pthread_mutex_t g_heap_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_heap_next = 1;
 static uint32_t g_heap_fifo[VMTL_BINDLESS_SLOTS]; static uint32_t g_heap_fifo_head, g_heap_fifo_n, g_heap_live;
+static void *g_heap_view[VMTL_BINDLESS_SLOTS];
 
 static nvk_image             g_dummyStex;
 static VkSampler             g_dummySampler;
@@ -2030,6 +2110,61 @@ static void vmtl_sampler_release(VkSampler handle)
     pthread_mutex_unlock(&g_sampler_intern_lock);
 }
 
+static float vmtl_sampler_bits_float(uint32_t bits)
+{
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+/* Diagnostic only: report the sampler actually present in the command buffer's bind table,
+   not the last Objective-C sampler object the encoder happened to see. */
+int vmtl_vk_trace_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, char *out, size_t cap)
+{
+    if (!out || !cap) return -1;
+    out[0] = 0;
+    if (!c || !c->table || set > 1 || index >= VMTL_NSAMP) {
+        snprintf(out, cap, "unavailable (set %u index %u)", set, index);
+        return -1;
+    }
+    const vmtl_bindtable *t = (const vmtl_bindtable *)c->table;
+    const vmtl_slot *slot = &t->s[set][VMTL_NBUF + VMTL_NTEX + index];
+    const VkSampler handle = (VkSampler)slot->h;
+    if (slot->kind != VMTL_SLOT_SAMP || handle == VK_NULL_HANDLE) {
+        snprintf(out, cap, "unbound (kind %u handle %p)", slot->kind, (void *)handle);
+        return -1;
+    }
+    vmtl_sampler_key key;
+    uint64_t refs = 0;
+    int found = 0;
+    pthread_mutex_lock(&g_sampler_intern_lock);
+    for (uint32_t i = g_sampler_handle_heads[vmtl_sampler_handle_bucket(handle)]; i;
+         i = g_sampler_entries[i].handle_next) {
+        if (g_sampler_entries[i].handle != handle) continue;
+        key = g_sampler_entries[i].key;
+        refs = g_sampler_entries[i].refs;
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&g_sampler_intern_lock);
+    const int parked = (t->park_mask[set] & (1u << index)) != 0;
+    if (!found) {
+        snprintf(out, cap, "handle %p parked %d NOT-IN-INTERNER", (void *)handle, parked);
+        return -1;
+    }
+    const uint32_t *w = key.words;
+    snprintf(out, cap,
+             "handle %p parked %d refs %llu flags %u mag %u min %u mip %u addr %u/%u/%u "
+             "bias %.9g aniso %u/%.9g compare %u/%u lod %.9g..%.9g border %u unnormalized %u",
+             (void *)handle, parked, (unsigned long long)refs,
+             w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+             (double)vmtl_sampler_bits_float(w[7]), w[8],
+             (double)vmtl_sampler_bits_float(w[9]), w[10], w[11],
+             (double)vmtl_sampler_bits_float(w[12]), (double)vmtl_sampler_bits_float(w[13]),
+             w[14], w[15]);
+    return 0;
+}
+
 static int vmtl_table_ubo(void)
 {
     static int v = -1;
@@ -2167,9 +2302,13 @@ static int ensure_descriptors(void) {
 
 static void vmtl_heap_write_locked(uint32_t slot, void *view)
 {
+    void *old = g_heap_view[slot];
     VkDescriptorImageInfo ii = { VK_NULL_HANDLE, (VkImageView)view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkWriteDescriptorSet w = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_heapSet, 0, slot, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii, NULL, NULL };
     pvkUpdateDescriptorSets(g_dev, 1, &w, 0, NULL);
+    g_heap_view[slot] = view;
+    if (old && old != view && vmtl_trace_on())
+        nvtrace("BLWRITE slot %u old %p new %p dummy %d", slot, old, view, view == g_dummyImg.view);
 }
 uint32_t vmtl_vk_bindless_put(void *view)
 {
@@ -2191,6 +2330,15 @@ void vmtl_vk_bindless_drop(uint32_t slot);
 static void **g_bl_key; static uint32_t *g_bl_val; static uint32_t g_bl_n; static pthread_mutex_t g_bl_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t vmtl_bl_hash(const void *p) { uint64_t x = (uint64_t)(uintptr_t)p; x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; return (uint32_t)x & (VMTL_BL_CAP - 1); }
 static int vmtl_bl_find_locked(const void *v) { uint32_t h = vmtl_bl_hash(v); while (g_bl_key[h]) { if (g_bl_key[h] == v) return (int)h; h = (h + 1) & (VMTL_BL_CAP - 1); } return -1; }
+static uint32_t vmtl_bl_peek(void *view)
+{
+    if (!view || !g_heapSet) return 0;
+    pthread_mutex_lock(&g_bl_lock);
+    int at = g_bl_key ? vmtl_bl_find_locked(view) : -1;
+    uint32_t slot = at >= 0 ? g_bl_val[at] : 0;
+    pthread_mutex_unlock(&g_bl_lock);
+    return slot;
+}
 uint32_t vmtl_bl_slot(void *view)
 {
     if (!view || !g_heapSet) return 0;
@@ -2460,6 +2608,39 @@ static int vmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuff
         const vmtl_slot *s = t ? &t->s[which][VMTL_NBUF + i] : NULL;
         addresses[2 * VMTL_NBUF + i] = (s && s->kind == VMTL_SLOT_TEX && s->h) ? (uint64_t)s->size : 0;
     }
+    /* Diagnostic only: UberCompositeFragment selects its source through entry 64. */
+    if (which == 1 && !access("/var/tmp/vmtl-cursor-trace", F_OK)) {
+        const vmtl_slot *s = t ? &t->s[which][VMTL_NBUF] : NULL;
+        const uint64_t id = addresses[2 * VMTL_NBUF];
+        pthread_mutex_lock(&g_heap_lock);
+        void *heap = id && id < VMTL_BINDLESS_SLOTS ? g_heap_view[id] : NULL;
+        pthread_mutex_unlock(&g_heap_lock);
+        const uint32_t live = s && s->h ? vmtl_bl_peek(s->h) : 0;
+        vmtl_icon_log("CURSORTAB cb %p seq %u kind %u view %p table %llu live %u "
+                      "heap %p match %d dummy %p",
+                      c, c->address_count, s ? s->kind : 0, s ? s->h : NULL,
+                      (unsigned long long)id, live, heap,
+                      s && s->kind == VMTL_SLOT_TEX && s->h && id == live && heap == s->h,
+                      g_dummyImg.view);
+    }
+    /* Diagnostic only: the YCbCr fixed shader reads v2uint entries 67/69/73.
+       Compare those exact per-draw table values with the current view->slot map. */
+    if (which == 1 && vmtl_trace_on()) {
+        static const unsigned tex[] = { 3, 5, 9 };
+        for (unsigned k = 0; k < sizeof tex / sizeof tex[0]; ++k) {
+            unsigned i = tex[k];
+            const vmtl_slot *s = t ? &t->s[which][VMTL_NBUF + i] : NULL;
+            if (s && s->kind == VMTL_SLOT_TEX && s->h) {
+                uint64_t id = addresses[2 * VMTL_NBUF + i];
+                pthread_mutex_lock(&g_heap_lock);
+                void *heap = id && id < VMTL_BINDLESS_SLOTS ? g_heap_view[id] : NULL;
+                pthread_mutex_unlock(&g_heap_lock);
+                nvtrace("ATAB seq %u entry %u tex %u view %p table %llu live %u heap %p",
+                        c->address_count, 2 * VMTL_NBUF + i, i, s->h,
+                        (unsigned long long)id, vmtl_bl_peek(s->h), heap);
+            }
+        }
+    }
     *out = (VkDescriptorBufferInfo){ page->buffer.buf, slot * VMTL_TABLE_BYTES, VMTL_TABLE_BYTES };
     c->address_count++;
     return 0;
@@ -2529,6 +2710,31 @@ static VkDescriptorSet vmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint3
 static VkDescriptorSet vmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
 { return vmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL); }
 #define VMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
+static int vmtl_icon_c_trace_diag(void) { return access("/var/tmp/vmtl-icon-trace", F_OK) == 0; }
+void vmtl_icon_log(const char *fmt, ...);
+static void vmtl_icon_descriptor_log(nvk_cmdbuf *c, uint32_t which, VkDescriptorSet set,
+                                     VkDescriptorSet from, const uint64_t *mask,
+                                     const uint64_t *copym, const char *decision)
+{
+    if (which != 1 || !c->icon_view || !vmtl_icon_c_trace_diag()) return;
+    const uint32_t binding = VMTL_NBUF + c->icon_binding;
+    const uint32_t sbinding = binding + VMTL_NTEX;
+    vmtl_bindtable *t = (vmtl_bindtable *)c->table;
+    const vmtl_slot *texture = t && binding < VMTL_NBIND ? &t->s[which][binding] : NULL;
+    const vmtl_slot *sampler = t && sbinding < VMTL_NBIND ? &t->s[which][sbinding] : NULL;
+    const int inmask = !mask || ((mask[binding >> 6] >> (binding & 63)) & 1);
+    const int copied = VMTL_COPY_HAS(copym, binding);
+    const int scopied = VMTL_COPY_HAS(copym, sbinding);
+    vmtl_icon_log("ICONDESC slot %u cb %p set %p from %p decision %s binding %u "
+                  "view %p slot %u/%p same %d dummy %p inmask %d copy %d "
+                  "sampler %u/%p scopy %d",
+                  c->icon_seq, c, set, from, decision, c->icon_binding, c->icon_view,
+                  texture ? texture->kind : 0, texture ? texture->h : NULL,
+                  texture && texture->h == c->icon_view, g_dummyImg.view,
+                  inmask, copied, sampler ? sampler->kind : 0,
+                  sampler ? sampler->h : NULL, scopied);
+    c->icon_view = NULL;
+}
 static VkDescriptorSet vmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
                                              VkDescriptorSet from, const uint64_t *copym)
 {
@@ -2598,12 +2804,22 @@ static VkDescriptorSet vmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint3
     VkDescriptorImageInfo  ii[VMTL_NBIND];
     VkBufferView tv[VMTL_NBIND];
     VkDescriptorBufferInfo addressInfo;
+    vmtl_bindtable *t = (vmtl_bindtable *)c->table;
     if (!g_mutable) tb = NULL;
-    if (VMTL_E78_HAS(mask, VMTL_ADDRESS_BINDING) && vmtl_address_snapshot(c, which, &addressInfo)) { c->skipped++; return VK_NULL_HANDLE; }
+    if (VMTL_E78_HAS(mask, VMTL_ADDRESS_BINDING)) {
+        if (vmtl_address_snapshot(c, which, &addressInfo)) { c->skipped++; return VK_NULL_HANDLE; }
+        if (which == 1 && t && t->s[1][3].kind == VMTL_SLOT_BUF &&
+            t->s[1][3].size == 262144 && vmtl_trace_on() &&
+            !access("/tmp/vmtl-descriptor-mask-request", F_OK))
+            nvtrace("DADDR cb %p set %p buf %p off %llu len %llu seq %u from %p",
+                    c, set, addressInfo.buffer,
+                    (unsigned long long)addressInfo.offset,
+                    (unsigned long long)addressInfo.range,
+                    c->address_count - 1, from);
+    }
     VkDescriptorBufferInfo dummyB = { (VkBuffer)g_dummyBuf.buf, 0, VK_WHOLE_SIZE };
     VkDescriptorImageInfo  dummyI = { VK_NULL_HANDLE, (VkImageView)g_dummyImg.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorImageInfo  dummyS = { g_dummySampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
-    vmtl_bindtable *t = (vmtl_bindtable *)c->table;
     uint32_t nw = 0;
     for (uint32_t i = 0; i < VMTL_STEX_BASE; i++) {
         if (!VMTL_E78_HAS(mask, i)) continue;
@@ -2611,6 +2827,10 @@ static VkDescriptorSet vmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint3
         const vmtl_slot *sl = t ? &t->s[which][i] : NULL;
         const VkDescriptorBufferInfo *pb = NULL; const VkDescriptorImageInfo *pi = NULL;
         if (ty == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || ty == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+            if (which == 1 && i == 3 && c->matrix_seq && sl && sl->kind == VMTL_SLOT_BUF &&
+                sl->size == 262144 && !access("/var/tmp/vmtl-draw-boundary-no-planes", F_OK))
+                nvlog("D3 seq %u cb %p set %p buffer %p off %zu",
+                      c->matrix_seq - 1, c, set, sl->h, sl->off);
             if (i == VMTL_ADDRESS_BINDING) pb = &addressInfo;
             else if (sl && sl->kind == VMTL_SLOT_BUF && (sl->off % VMTL_SSBO_ALIGN) == 0) {
                 bi[i] = (VkDescriptorBufferInfo){ (VkBuffer)sl->h, sl->off, VK_WHOLE_SIZE }; pb = &bi[i];
@@ -2634,6 +2854,11 @@ static VkDescriptorSet vmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint3
             else pi = &dummyS;
         }
         w[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, VMTL_BINDING_NUMBER(i), 0, 1, ty, pi, pb, NULL };
+        if (which == 1 && i == 3 && pb) {
+            nvk_setref *sr = &c->sets[c->nsets - 1];
+            sr->b3 = pb->buffer; sr->b3off = (size_t)pb->offset; sr->b3range = (size_t)pb->range;
+            sr->b3write = 1; sr->b3dummy = pb == &dummyB;
+        }
     }
     if (stex_hi > VMTL_NSTEX) stex_hi = VMTL_NSTEX;
     for (uint32_t j = 0; j < stex_hi; j++) {
@@ -2653,12 +2878,27 @@ static VkDescriptorSet vmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint3
         w[nw++] = (VkWriteDescriptorSet){ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, set, VMTL_BINDING_NUMBER(i), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[i], NULL, NULL };
     }
     vmtl_enc78_count(E78C_WRITES, nw);
+    vmtl_icon_descriptor_log(c, which, set, from, mask, copym, from ? "new-copy" : "new-full");
     pvkUpdateDescriptorSets(g_dev, nw, w, ncp, cp);
     return set;
 }
 static VkDescriptorSet vmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const nvk_pipeline *p)
 {
     vmtl_bindtable *t = (vmtl_bindtable *)c->table;
+    const int dtrace = which == 1 && t && t->s[1][3].kind == VMTL_SLOT_BUF &&
+                       t->s[1][3].size == 262144 && vmtl_trace_on() &&
+                       !access("/tmp/vmtl-descriptor-mask-request", F_OK);
+    if (dtrace)
+        nvtrace("DMASK cb %p pipe %p h3 %d tbany %u bok %u gok %u "
+                "g %016llx %016llx %016llx %016llx addr %u dirty %u",
+                c, p, vmtl_enc78_on(VMTL_E78_H3), p->tbany, p->bmask_ok,
+                p->gmask_ok,
+                (unsigned long long)p->gmask[which][0],
+                (unsigned long long)p->gmask[which][1],
+                (unsigned long long)p->gmask[which][2],
+                (unsigned long long)p->gmask[which][3],
+                VMTL_E78_HAS(p->gmask[which], VMTL_ADDRESS_BINDING),
+                t->dirty[which]);
     if (!t || which > 1 || !vmtl_enc78_on(VMTL_E78_H3) || p->tbany) return vmtl_snapshot_set_t(c, which, p->stex_hi[which], p->tbany ? p->tbm[which] : NULL);
     const uint64_t all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
     const uint64_t *pm = p->bmask_ok ? p->bmask : (p->gmask_ok && which < 2) ? p->gmask[which] : all;
@@ -2668,7 +2908,15 @@ static VkDescriptorSet vmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const 
     if (live && hi <= t->last_hi[which]) {
         int covered = 1;
         for (int k = 0; k < 4; k++) if (pm[k] & ~t->lastw[which][k]) covered = 0;
-        if (covered) { vmtl_enc78_count(E78C_SETREUSE, 1); return t->last[which]; }
+        if (covered) {
+            if (dtrace)
+                nvtrace("DREUSE cb %p set %p addr %u count %u", c,
+                        t->last[which],
+                        VMTL_E78_HAS(t->lastw[which], VMTL_ADDRESS_BINDING),
+                        c->address_count);
+            vmtl_icon_descriptor_log(c, which, t->last[which], VK_NULL_HANDLE, pm, NULL, "reuse");
+            vmtl_enc78_count(E78C_SETREUSE, 1); return t->last[which];
+        }
     }
     uint64_t m[4];
     for (int k = 0; k < 4; k++) m[k] = pm[k] | (live ? t->lastw[which][k] : 0);
@@ -2683,6 +2931,12 @@ static VkDescriptorSet vmtl_snapshot_set_c(nvk_cmdbuf *c, uint32_t which, const 
         }
         for (int k = 0; k < 4; k++) cm[k] &= ~t->chg[which][k];
     }
+    if (dtrace)
+        nvtrace("DNEW cb %p live %d from %p count %u addr %u "
+                "m %016llx %016llx %016llx %016llx", c, live, from,
+                c->address_count, VMTL_E78_HAS(m, VMTL_ADDRESS_BINDING),
+                (unsigned long long)m[0], (unsigned long long)m[1],
+                (unsigned long long)m[2], (unsigned long long)m[3]);
     VkDescriptorSet s = vmtl_snapshot_set_md(c, which, hi, m, NULL, from, from ? cm : NULL);
     if (!s) return s;
     t->last[which] = s; t->last_idx[which] = c->nsets - 1; t->last_hi[which] = hi; t->dirty[which] = 0;
@@ -2730,7 +2984,50 @@ int vmtl_vk_bind_texture(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_image 
 int vmtl_vk_bind_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s)
 {
     if (index >= VMTL_NSAMP) { nvlog("bind sampler: index %u is outside [0,%d)", index, VMTL_NSAMP); return -1; }
+    // The app set this slot itself, so a sampler parked here has nothing to hand back.
+    if (set <= 1 && c->table) ((vmtl_bindtable *)c->table)->park_mask[set] &= ~(1u << index);
     return vmtl_bind_slot(c, set, VMTL_NBUF + VMTL_NTEX + index, s ? VMTL_SLOT_SAMP : VMTL_SLOT_NONE, s ? s->s : NULL, 0);
+}
+/* Metal keeps an app's sampler in its slot while a shader with its own constexpr or argument-buffer sampler draws.
+   Vulkan has no such samplers, so the translator parks them in slots the shader leaves free. Keep what each one
+   displaced and put it back once a shader no longer needs the slot: Core Animation binds a linear sampler once,
+   then its Dock upscale read a parked nearest sampler and drew 32x32 blocks (#363).
+   VMTL_NO_SAMPLER_RESTORE=1 keeps the old behaviour. */
+static int vmtl_sampler_restore_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("VMTL_NO_SAMPLER_RESTORE"); on = !(e && *e && *e != '0');
+        nvlog("vk: app samplers displaced by a shader's own sampler are %s (VMTL_NO_SAMPLER_RESTORE=%s)", on ? "put back" : "left overwritten (OLD)", e ? e : "unset"); }
+    return on;
+}
+int vmtl_vk_bind_parked_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s)
+{
+    if (!vmtl_sampler_restore_on()) return vmtl_vk_bind_sampler(c, set, index, s);
+    if (index >= VMTL_NSAMP || set > 1) { nvlog("bind parked sampler: index %u set %u out of range", index, set); return -1; }
+    const uint32_t b = VMTL_NBUF + VMTL_NTEX + index, bit = 1u << index;
+    vmtl_bindtable *t = (vmtl_bindtable *)c->table;
+    const uint8_t kind = t ? t->s[set][b].kind : VMTL_SLOT_NONE;
+    void *h = t ? t->s[set][b].h : NULL;
+    const int parked = t && (t->park_mask[set] & bit) && kind == t->park_kind[set][index] && h == t->park_h[set][index];
+    int r = vmtl_bind_slot(c, set, b, s ? VMTL_SLOT_SAMP : VMTL_SLOT_NONE, s ? s->s : NULL, 0);
+    if (r) return r;
+    t = (vmtl_bindtable *)c->table;
+    if (!parked) { t->park_saved_kind[set][index] = kind; t->park_saved[set][index] = h; }
+    t->park_kind[set][index] = t->s[set][b].kind; t->park_h[set][index] = t->s[set][b].h;
+    t->park_mask[set] |= bit;
+    return 0;
+}
+void vmtl_vk_parked_samplers_keep(nvk_cmdbuf *c, uint32_t set, uint32_t keep)
+{
+    vmtl_bindtable *t = c ? (vmtl_bindtable *)c->table : NULL;
+    if (!t || set > 1) return;
+    for (uint32_t drop = t->park_mask[set] & ~keep; drop; drop &= drop - 1) {
+        const uint32_t i = (uint32_t)__builtin_ctz(drop), b = VMTL_NBUF + VMTL_NTEX + i;
+        const vmtl_slot *sl = &t->s[set][b];
+        if (sl->kind == t->park_kind[set][i] && sl->h == t->park_h[set][i])
+            vmtl_bind_slot(c, set, b, t->park_saved_kind[set][i], t->park_saved[set][i], 0);
+        t->park_mask[set] &= ~(1u << i);
+    }
 }
 
 int vmtl_vk_sample_positions_backend(void) { return vmtl_vk_init() == 0 && g_sample_locations; }
@@ -2744,6 +3041,15 @@ static VkSampleLocationsInfoEXT vmtl_sample_info(const vmtl_sample_pattern *p, V
     for (uint32_t i = 0; i < p->count; ++i) vk[i] = (VkSampleLocationEXT){ vmtl_sample_raster_coordinate(p->position[i].x), vmtl_sample_raster_coordinate(p->position[i].y) };
     return (VkSampleLocationsInfoEXT){ VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT, NULL,
         (VkSampleCountFlagBits)p->count, {1,1}, p->count, vk };
+}
+
+void vmtl_vk_diag_matrix_set(nvk_cmdbuf *c, void **set, nvk_setref *ref)
+{
+    vmtl_bindtable *t = c ? (vmtl_bindtable *)c->table : NULL;
+    const unsigned i = t ? t->last_idx[1] : 0;
+    if (!t || !t->last[1] || i >= c->nsets) return;
+    *set = t->last[1];
+    if (ref) *ref = c->sets[i];
 }
 
 void vmtl_vk_cmd_bind_set(nvk_cmdbuf *c, nvk_pipeline *p)
@@ -3475,6 +3781,291 @@ int vmtl_vk_pipeline_create_rt(const void *vs, size_t vn, const void *fs, size_t
             nvlog("pipeline REFUSED: colour attachments %u and %u blend differently and this device has no independentBlend", f0, i); return -1; }
     return vmtl_vk_pipeline_create_impl(vs, vn, fs, fn, rt->ncol ? rt->cfmt[0] : 0u, rt->dfmt, NULL, vin, samples, td, rt, out);
 }
+/* Research diagnostic: return directly from the YCbCr matrix block. The
+   generic fixed fragment has many unrelated modes, so patching its final
+   store or transfer selectors would change those modes too. Values defined
+   in this block dominate the local store and return; all other paths remain
+   byte-for-byte unchanged apart from the one-word module compaction. */
+static size_t vmtl_wallpaper_output_diagnostic(uint32_t *w, size_t bytes,
+                                               const void *input, size_t input_bytes,
+                                               int blend_enable)
+{
+    const int want_y = !access("/tmp/vmtl-wallpaper-y-request", F_OK);
+    const int want_c = !access("/tmp/vmtl-wallpaper-cbcr-request", F_OK);
+    const int want_l = !access("/var/tmp/vmtl-wallpaper-linear-request", F_OK);
+    const int want_v = !access("/var/tmp/vmtl-wallpaper-vector-request", F_OK);
+    const int want_r0 = !access("/var/tmp/vmtl-wallpaper-row0-request", F_OK);
+    const int want_scalar = !access("/var/tmp/vmtl-wallpaper-row0-scalar-request", F_OK);
+    const int want_element = !access("/var/tmp/vmtl-wallpaper-row0-element-request", F_OK);
+    const int want_zero = !access("/var/tmp/vmtl-matrix-zero-offset", F_OK);
+    const int want_white = !access("/var/tmp/vmtl-wallpaper-white-request", F_OK);
+    const int want_noclamp = !access("/var/tmp/vmtl-wallpaper-noclamp-request", F_OK);
+    const int want_clampminmax = !access("/var/tmp/vmtl-wallpaper-clampminmax-request", F_OK);
+    const int want_ay = !access("/var/tmp/vmtl-wallpaper-alpha-y-request", F_OK);
+    const int want_acb = !access("/var/tmp/vmtl-wallpaper-alpha-cb-request", F_OK);
+    const int want_acr = !access("/var/tmp/vmtl-wallpaper-alpha-cr-request", F_OK);
+    const int want_alpha = want_ay || want_acb || want_acr;
+    if (want_y + want_c + want_l + want_v + want_r0 + want_scalar + want_element + want_white + want_noclamp +
+        want_clampminmax + want_ay + want_acb + want_acr != 1) return bytes;
+    if (want_zero && !want_element) return bytes;
+    size_t n = bytes / 4;
+    uint32_t h = 2166136261u;
+    const uint8_t *b = (const uint8_t *)input;
+    for (size_t i = 0; i < input_bytes; i++) { h ^= b[i]; h *= 16777619u; }
+    if (!w || n < 5 || w[0] != 0x07230203u) return bytes;
+    uint32_t id_y = 3436, id_c = 3435, id_linear = 4394, id_linear_alt = 4422;
+    uint32_t id_y_phi = 1899, id_c_phi = 2662;
+    uint32_t id_clamp = 4392, id_sum = 4391, id_local = 24459;
+    uint32_t id_selector = 26619, id_branch = 24400, id_branch_alt = 24401, id_out = 536;
+    uint32_t id_vector = 4368, id_row0 = 4370, id_v4one = 329, id_load = 4369;
+    uint32_t id_matrix_ptr = 580;
+    if (h == 0x397298c5) {
+        id_y = 3667; id_c = 3666; id_linear = 4890; id_linear_alt = 4859;
+        id_y_phi = 2084; id_c_phi = 2870;
+        id_clamp = 4888; id_sum = 4887; id_local = 24654;
+        id_selector = 26816; id_branch = 24613; id_branch_alt = 24612; id_out = 571;
+        id_vector = 4864; id_row0 = 4866; id_v4one = 338; id_load = 4865;
+        id_matrix_ptr = 604;
+    } else if (h != 0x70415cd3) return bytes;
+    if (want_alpha && blend_enable) return bytes;
+    int have_y = 0, have_c = 0, have_l = 0;
+    int matrix_clamp = -1, matrix_store = -1, matrix_store_alt = -1, final_store = -1, var_decl = -1;
+    int linear_shuffle = -1, matrix_load = -1;
+    uint32_t id_float = 0, id_v4float = 0, id_ptr = 0, id_storage = 0, id_one = 0;
+    uint32_t id_ptr_float = 0, id_matrix_var = 0, id_uint = 0, id_index[3] = {0}, id_index18 = 0;
+    for (size_t i = 5; i < n; ) {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xffffu;
+        if (!wc || i + wc > n) return bytes;
+        if (op == 22 && wc == 3 && w[i + 2] == 32) {
+            id_float = w[i + 1];
+        } else if (op == 21 && wc == 4 && w[i + 2] == 32 && !w[i + 3]) {
+            id_uint = w[i + 1];
+        } else if (op == 32 && wc == 4 && w[i + 2] == 12 && w[i + 3] == id_float) {
+            id_ptr_float = w[i + 1];
+        } else if (op == 43 && wc == 4 && w[i + 1] == id_uint && w[i + 3] == 18) {
+            id_index18 = w[i + 2];
+        } else if (op == 43 && wc == 4 && w[i + 1] == id_uint && w[i + 3] <= 2) {
+            id_index[w[i + 3]] = w[i + 2];
+        } else if ((op == 65 || op == 66) && wc >= 4 && w[i + 2] == id_matrix_ptr) {
+            id_matrix_var = w[i + 3];
+        } else if (op == 59 && wc == 4 && w[i + 2] == id_local) {
+            var_decl = (int)i; id_ptr = w[i + 1]; id_storage = w[i + 3];
+        } else if (op == 87 && wc >= 5) {
+            if (w[i + 2] == id_y_phi) have_y = 1;
+            if (w[i + 2] == id_c_phi) have_c = 1;
+        } else if (op == 79 && wc >= 7 && w[i + 2] == id_linear - 1 &&
+                   w[i + 3] == id_clamp) {
+            linear_shuffle = (int)i;
+        } else if (op == 82 && wc >= 6 && w[i + 2] == id_linear) {
+            have_l = 1;
+            id_v4float = w[i + 1]; id_one = w[i + 3];
+        } else if (op == 12 && wc >= 6 && w[i + 2] == id_clamp &&
+                   w[i + 5] == id_sum) {
+            matrix_clamp = (int)i;
+        } else if (op == 61 && wc == 4 && w[i + 2] == id_load) {
+            matrix_load = (int)i;
+        } else if (op == 62 && wc == 3) {
+            if (w[i + 1] == id_local && w[i + 2] == id_linear)
+                matrix_store = (int)i;
+            if (w[i + 1] == id_local && w[i + 2] == id_linear_alt)
+                matrix_store_alt = (int)i;
+            if (w[i + 1] == id_out) final_store = (int)i;
+        }
+        i += wc;
+    }
+    int s = matrix_store;
+    const int a = matrix_store_alt;
+    const int alt_ok = a >= 0 && (size_t)a + 8 <= n &&
+        w[a + 3] == 0x0003003eu && w[a + 4] == id_selector &&
+        w[a + 6] == 0x000200f9u && w[a + 7] == id_branch_alt;
+    if (s < 0 || (size_t)s + 8 > n || !have_y || !have_c || !have_l ||
+        matrix_clamp < 0 || ((want_noclamp || want_clampminmax) && linear_shuffle < 0) ||
+        (want_scalar && (!id_float || !id_v4float || !id_one || matrix_load < 0)) ||
+        (want_element && (!alt_ok || !id_float || !id_v4float || !id_one || !id_ptr_float ||
+                          !id_matrix_var || !id_index[0] || !id_index[1] || !id_index[2])) ||
+        (want_zero && !id_index18) ||
+        w[s + 3] != 0x0003003eu ||
+        w[s + 4] != id_selector || w[s + 6] != 0x000200f9u ||
+        w[s + 7] != id_branch) {
+        nvlog("DIAG wallpaper local output REFUSED: input fs %08x bound %u "
+              "(Y %d CbCr %d linear %d clamp %d matrix-store %d)",
+              h, w[3], have_y, have_c, have_l, matrix_clamp, matrix_store);
+        return bytes;
+    }
+    if (want_alpha) {
+        if (final_store < 0 || var_decl < 0 || !id_float || !id_v4float || !id_ptr) {
+            nvlog("DIAG wallpaper alpha output REFUSED: input fs %08x final %d var %d float %u v4 %u",
+                  h, final_store, var_decl, id_float, id_v4float);
+            return bytes;
+        }
+        int entry_init = var_decl + 4;
+        while ((size_t)entry_init < n && (w[entry_init] & 0xffffu) == 59 &&
+               (w[entry_init] >> 16) == 4) entry_init += 4;
+        const uint32_t diag = w[3], loaded = w[3] + 1;
+        const uint32_t scalar = w[3] + 2, vector = w[3] + 3;
+        const uint32_t sample = want_ay ? id_y : id_c;
+        const uint32_t component = want_acr ? 1 : 0;
+        const uint32_t value = w[final_store + 2];
+        /* Insert from the end towards the entry so the original word indices
+           remain valid.  The sample crosses blocks through memory, not SSA. */
+        memmove(w + final_store + 15, w + final_store,
+                (n - (size_t)final_store) * sizeof(*w));
+        w[final_store + 0] = (4u << 16) | 61u; /* OpLoad */
+        w[final_store + 1] = id_v4float;
+        w[final_store + 2] = loaded;
+        w[final_store + 3] = diag;
+        w[final_store + 4] = (5u << 16) | 81u; /* OpCompositeExtract */
+        w[final_store + 5] = id_float;
+        w[final_store + 6] = scalar;
+        w[final_store + 7] = loaded;
+        w[final_store + 8] = component;
+        w[final_store + 9] = (6u << 16) | 82u; /* OpCompositeInsert */
+        w[final_store + 10] = id_v4float;
+        w[final_store + 11] = vector;
+        w[final_store + 12] = scalar;
+        w[final_store + 13] = value;
+        w[final_store + 14] = 3;
+        w[final_store + 17] = vector;
+        n += 15;
+        const int sample_store = s + 3;
+        memmove(w + sample_store + 3, w + sample_store,
+                (n - (size_t)sample_store) * sizeof(*w));
+        w[sample_store + 0] = 0x0003003eu; /* OpStore */
+        w[sample_store + 1] = diag;
+        w[sample_store + 2] = sample;
+        n += 3;
+        memmove(w + entry_init + 3, w + entry_init,
+                (n - (size_t)entry_init) * sizeof(*w));
+        w[entry_init + 0] = 0x0003003eu;
+        w[entry_init + 1] = diag;
+        w[entry_init + 2] = id_v4one;
+        n += 3;
+        const int new_var = var_decl + 4;
+        memmove(w + new_var + 4, w + new_var,
+                (n - (size_t)new_var) * sizeof(*w));
+        w[new_var + 0] = 0x0004003bu; /* OpVariable */
+        w[new_var + 1] = id_ptr;
+        w[new_var + 2] = diag;
+        w[new_var + 3] = id_storage;
+        n += 4;
+        w[3] += 4;
+        nvlog("DIAG wallpaper final alpha %s ENABLED: input fs %08x bound %u, "
+              "final store word %d, RGB and transfer unchanged; module %zu -> %zu bytes",
+              want_ay ? "Y" : want_acb ? "Cb" : "Cr", h, w[3], final_store,
+              bytes, bytes + 100);
+        return bytes + 100;
+    }
+    if (want_element) {
+        const uint32_t first_ptr = w[3], first_value = w[3] + 3;
+        const uint32_t vector_x = w[3] + 6, vector_y = w[3] + 7, vector_z = w[3] + 8;
+        const uint32_t plain_z = w[3] + 9, rgba = w[3] + 10;
+        memmove(w + s + 67, w + s, (n - (size_t)s) * sizeof(*w));
+        for (uint32_t k = 0; k < 3; k++) {
+            const int at = s + (int)k * 13;
+            w[at + 0] = (7u << 16) | 66u; /* OpInBoundsAccessChain: matrix[0][0][k] */
+            w[at + 1] = id_ptr_float; w[at + 2] = first_ptr + k;
+            w[at + 3] = id_matrix_var;
+            w[at + 4] = id_index[0]; w[at + 5] = want_zero ? id_index18 : id_index[0];
+            w[at + 6] = id_index[k];
+            w[at + 7] = (6u << 16) | 61u; /* OpLoad, Volatile | Aligned 4 */
+            w[at + 8] = id_float; w[at + 9] = first_value + k;
+            w[at + 10] = first_ptr + k; w[at + 11] = 3; w[at + 12] = 4;
+        }
+        /* Repeat the exact v42 non-volatile scalar z load beside the volatile
+           reference.  Consume no original vector lane, preventing a merge. */
+        w[s + 39] = (6u << 16) | 61u; /* OpLoad, Aligned 4 */
+        w[s + 40] = id_float; w[s + 41] = plain_z;
+        w[s + 42] = first_ptr + 2; w[s + 43] = 2; w[s + 44] = 4;
+        for (uint32_t k = 0; k < 3; k++) {
+            const int at = s + 45 + (int)k * 5;
+            w[at + 0] = (5u << 16) | 81u; /* OpCompositeExtract */
+            w[at + 1] = id_float; w[at + 2] = vector_x + k;
+            w[at + 3] = id_load; w[at + 4] = k;
+        }
+        w[s + 60] = (7u << 16) | 80u; /* OpCompositeConstruct */
+        w[s + 61] = id_v4float; w[s + 62] = rgba;
+        w[s + 63] = plain_z; w[s + 64] = first_value + 2;
+        w[s + 65] = id_one; w[s + 66] = id_one;
+        n += 67; s += 67; w[3] += 11;
+        w[s + 1] = id_out; w[s + 2] = rgba;
+        w[s + 6] = 0x000100fdu; /* OpReturn */
+        memmove(w + s + 7, w + s + 8, (n - (size_t)s - 8) * sizeof(*w));
+        nvlog("DIAG wallpaper VOLATILE-COMPARE ENABLED: input fs %08x bound %u, "
+              "R=plain direct scalar z, G=volatile direct scalar z, B/A=constant 1; "
+              "array index %u; module %zu -> %zu bytes",
+              h, w[3], want_zero ? 18u : 0u, bytes, bytes + 264);
+        return bytes + 264;
+    }
+    if (want_scalar) {
+        const uint32_t x = w[3], y = w[3] + 1, z = w[3] + 2, rgba = w[3] + 3;
+        /* The original row0 vector load is the only matrix row without an
+           alignment operand.  Preserve its address and value, adding only
+           the same Aligned 16 used by the following matrix rows. */
+        memmove(w + matrix_load + 6, w + matrix_load + 4,
+                (n - (size_t)matrix_load - 4) * sizeof(*w));
+        w[matrix_load] = (6u << 16) | 61u;
+        w[matrix_load + 4] = 2; w[matrix_load + 5] = 16;
+        n += 2; s += 2;
+        memmove(w + s + 22, w + s, (n - (size_t)s) * sizeof(*w));
+        for (uint32_t k = 0; k < 3; k++) {
+            const int at = s + (int)k * 5;
+            w[at + 0] = (5u << 16) | 81u; /* OpCompositeExtract */
+            w[at + 1] = id_float; w[at + 2] = x + k;
+            w[at + 3] = id_load; w[at + 4] = k;
+        }
+        w[s + 15] = (7u << 16) | 80u; /* OpCompositeConstruct */
+        w[s + 16] = id_v4float; w[s + 17] = rgba;
+        w[s + 18] = x; w[s + 19] = y; w[s + 20] = z; w[s + 21] = id_one;
+        n += 22; s += 22; w[3] += 4;
+        w[s + 1] = id_out; w[s + 2] = rgba;
+        w[s + 6] = 0x000100fdu; /* OpReturn */
+        memmove(w + s + 7, w + s + 8, (n - (size_t)s - 8) * sizeof(*w));
+        nvlog("DIAG wallpaper aligned vector XYZ ENABLED: input fs %08x bound %u, "
+              "original row0 vec4 load changed only to Aligned 16, direct x/y/z output; "
+              "module %zu -> %zu bytes",
+              h, w[3], bytes, bytes + 92);
+        return bytes + 92;
+    }
+    if (!want_clampminmax) w[s + 1] = id_out; /* fragment output */
+    if (want_y || want_c || want_white)
+        w[s + 2] = want_y ? id_y : want_c ? id_c : id_v4one;
+    if (want_v || want_r0)
+        w[matrix_clamp + 5] = want_r0 ? id_row0 : id_vector; /* matrix row 0 or Y/Cb/Cr */
+    size_t result_bytes = bytes - 4;
+    if (want_noclamp)
+        w[linear_shuffle + 3] = id_sum; /* preserve matrix arithmetic, bypass only FClamp */
+    if (want_clampminmax) {
+        const uint32_t lower = w[3], upper = w[3] + 1;
+        const uint32_t ty = w[matrix_clamp + 1], ext = w[matrix_clamp + 3];
+        memmove(w + linear_shuffle + 14, w + linear_shuffle,
+                (n - (size_t)linear_shuffle) * sizeof(*w));
+        w[linear_shuffle + 0] = (7u << 16) | 12u; /* OpExtInst FMax(sum, 0) */
+        w[linear_shuffle + 1] = ty; w[linear_shuffle + 2] = lower;
+        w[linear_shuffle + 3] = ext; w[linear_shuffle + 4] = 40;
+        w[linear_shuffle + 5] = id_sum; w[linear_shuffle + 6] = w[matrix_clamp + 6];
+        w[linear_shuffle + 7] = (7u << 16) | 12u; /* OpExtInst FMin(..., 1) */
+        w[linear_shuffle + 8] = ty; w[linear_shuffle + 9] = upper;
+        w[linear_shuffle + 10] = ext; w[linear_shuffle + 11] = 37;
+        w[linear_shuffle + 12] = lower; w[linear_shuffle + 13] = w[matrix_clamp + 7];
+        w[linear_shuffle + 17] = upper; /* original vector shuffle's first operand */
+        w[3] += 2; n += 14; s += 14; result_bytes = bytes + 56;
+        nvlog("DIAG wallpaper FMin/FMax clamp ENABLED: input fs %08x bound %u, "
+              "original transfer and output preserved; module %zu -> %zu bytes",
+              h, w[3], bytes, result_bytes);
+        return result_bytes;
+    }
+    w[s + 6] = 0x000100fdu; /* OpReturn */
+    memmove(w + s + 7, w + s + 8, (n - (size_t)s - 8) * sizeof(*w));
+    const char *name = want_y ? "raw Y" : want_c ? "raw CbCr" :
+                       want_v ? "Y/Cb/Cr vector" : want_r0 ? "matrix row 0" :
+                       want_white ? "constant white" : want_noclamp ? "unclamped linear RGB" :
+                       want_clampminmax ? "FMin/FMax-clamped linear RGB" : "linear RGB";
+    nvlog("DIAG wallpaper matrix-local %s output ENABLED: input fs %08x "
+          "bound %u, matrix store word %d -> fragment output, clamp word %d, "
+          "branch word %d -> OpReturn; module %zu -> %zu bytes",
+          name, h, w[3], s, matrix_clamp, s + 6, bytes, result_bytes);
+    return result_bytes;
+}
 static int vmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vkfmt, uint32_t depthfmt, const void *blend_,
                                          const void *vin_, uint32_t samples, const nvk_tess_desc *td, const nvk_rt *rt, void *out_);
 static int vmtl_vk_pipeline_create_impl(const void *vs, size_t vn, const void *fs, size_t fn, uint32_t vkfmt, uint32_t depthfmt, const void *blend_,
@@ -3490,12 +4081,26 @@ static int vmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn,
                                          const void *vin_, uint32_t samples, const nvk_tess_desc *td, const nvk_rt *rt, void *out_)
 {
     const nvk_blend_state *blend = (const nvk_blend_state *)blend_; const nvk_vertex_input *vin = (const nvk_vertex_input *)vin_; nvk_pipeline *out = (nvk_pipeline *)out_;
+    const void *input_fs = fs; size_t input_fn = fn;
     nvk_rt lrt;
     if (!rt) {
         memset(&lrt, 0, sizeof lrt); lrt.ncol = vkfmt ? 1u : 0u; lrt.cfmt[0] = vkfmt; lrt.dfmt = depthfmt;
         lrt.blend[0] = blend ? *blend : (nvk_blend_state){ VK_FALSE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
                                                            VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD, 0xf };
         rt = &lrt;
+    }
+    uint32_t wp_h = 2166136261u;
+    for (size_t wpi = 0; wpi < input_fn; wpi++) {
+        wp_h ^= ((const uint8_t *)input_fs)[wpi]; wp_h *= 16777619u;
+    }
+    if (wp_h == 0x70415cd3 || wp_h == 0x397298c5) {
+        const nvk_blend_state *wb = &rt->blend[0];
+        nvlog("WPPIPE fs %08x out %p ncol %u cfmt %u blend %u "
+              "rgb(%u,%u,op %u) alpha(%u,%u,op %u) mask %x discard %u a2c %u a2one %u",
+              wp_h, out, rt->ncol, rt->ncol ? rt->cfmt[0] : 0, wb->enabled,
+              wb->src_rgb, wb->dst_rgb, wb->op_rgb,
+              wb->src_alpha, wb->dst_alpha, wb->op_alpha, wb->write_mask,
+              rt->discard, rt->a2c, rt->a2one);
     }
     if (samples != 1 && samples != 2 && samples != 4 && samples != 8) { nvlog("pipeline: rasterSampleCount %u is not carried (1, 2, 4, 8)", samples); return -1; }
     NSData *vdata = vmtl_address_shader(vs, vn), *fdata = vmtl_address_shader(fs, fn);
@@ -3548,13 +4153,15 @@ static int vmtl_vk_pipeline_create_impl_lifetime_body(const void *vs, size_t vn,
     if (!vmtl_spirv_ok(vs, vn, "vertex module") || !vmtl_spirv_ok(fs, fn, "fragment module")) return -1;
     if (!td) out->gmask_ok = (uint32_t)(vmtl_spirv_bmask(vs, vn, out->gmask[0]) && vmtl_spirv_bmask(fs, fn, out->gmask[1]));
     VkShaderModuleCreateInfo vsm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, vn, (const uint32_t *)vs };
-    uint32_t *fcopy = (uint32_t *)malloc(fn);
+    uint32_t *fcopy = (uint32_t *)malloc(fn + 1024);
     if (!fcopy) { nvlog("vk: out of memory copying the fragment module"); return -1; }
     memcpy(fcopy, fs, fn);
     if (ensure_descriptors()) { free(fcopy); return -1; }
     if (!g_heapSet && (vmtl_spirv_uses_set(vs, vn / 4, 2) || vmtl_spirv_uses_set(fs, fn / 4, 2))) {
         free(fcopy); nvlog("vk: render pipeline REFUSED - a shader indexes the bindless heap (set 2) and this device has none"); return -1; }
     vmtl_spirv_retarget_set(fcopy, fn / 4, 1);
+    fn = vmtl_wallpaper_output_diagnostic(fcopy, fn, input_fs, input_fn,
+                                          rt->blend[0].enabled);
     VkShaderModuleCreateInfo fsm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fn, fcopy };
     VkShaderModule vmod = VK_NULL_HANDLE, fmod = VK_NULL_HANDLE, tvm = VK_NULL_HANDLE, tcm = VK_NULL_HANDLE;
     VMTL_PIPELINE_STAGE(pvkCreateShaderModule(g_dev, &vsm, NULL, &vmod), "vkCreateShaderModule(vertex)");
@@ -4211,6 +4818,15 @@ static void vmtl_clear_colour(VkClearColorValue *cv, uint32_t fmt, const float c
 }
 
 static void vmtl_private_depth_layout(nvk_cmdbuf *, nvk_image *, VkImageLayout);
+static void img_to(nvk_cmdbuf *, nvk_image *, VkImageLayout,
+                   VkAccessFlags, VkAccessFlags, VkPipelineStageFlags, VkPipelineStageFlags);
+static int vmtl_load_barrier_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("VMTL_LOAD_BARRIER"); on = !(e && e[0] == '0');
+        nvlog("load-attachment layout barriers %s (VMTL_LOAD_BARRIER=%s)", on ? "on" : "off", e ? e : "unset"); }
+    return on;
+}
 int vmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
 {
     if (!p->rp || !ps->w || !ps->h) { nvlog("begin_render: apps2 no render pass or a %ux%u pass — pass REFUSED", ps->w, ps->h); return -1; }
@@ -4319,8 +4935,17 @@ int vmtl_vk_cmd_begin_pass(nvk_cmdbuf *c, const nvk_pass *ps, nvk_pipeline *p)
     }
     for (uint32_t i = 0; i < ncol; i++) {
         if (!cf[i]) continue;
-        if (first) { was = ps->col[i]->layout; first = 0; }
-        ps->col[i]->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        nvk_image *img = ps->col[i];
+        // A Load render pass declares TRANSFER_SRC as its initial layout. SurfaceIn leaves a freshly uploaded image in
+        // SHADER_READ_ONLY, and a current zero-copy wrapper can still be PREINITIALIZED. Record the real transition
+        // instead of merely changing our bookkeeping and making Vulkan discard or misinterpret the loaded contents.
+        if ((ps->load & VMTL_LOAD_COLOUR(i)) && vmtl_load_barrier_on())
+            img_to(c, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                   VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        if (first) { was = img->layout; first = 0; }
+        img->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         views[nviews++] = (VkImageView)ps->colview[i];
     }
     if (p->has_depth) { views[nviews++] = (VkImageView)ps->dsview; if (ps->ds) ps->ds->layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL; }
@@ -5022,6 +5647,7 @@ int vmtl_vk_submit_wait_at(nvk_cmdbuf *c, const char *who)
 }
 int vmtl_vk_submit_begin_at(nvk_cmdbuf *c, vmtl_inflight *f, const char *who)
 {
+    vmtl_icon_log(NULL);
     vmtl_subwho_note(who, 0);
     memset(f, 0, sizeof *f); f->c = c;
     uint64_t *const pt = f->pt;
@@ -5041,7 +5667,11 @@ int vmtl_vk_submit_begin_at(nvk_cmdbuf *c, vmtl_inflight *f, const char *who)
     const uint32_t wseq = vmtl_keep_on() ? vmtl_wit_record(c) : 0;
     VkResult result = pvkEndCommandBuffer(c->cb);
     const uint64_t sB = vmtl_perf_now();
-    if (result != VK_SUCCESS) { vmtl_cmd_retire(c); return -1; }
+    if (result != VK_SUCCESS) {
+        nvlog("vk: main command buffer End -> %d", result);
+        vmtl_cmd_retire(c);
+        return -1;
+    }
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }; VkFence fence;
     result = pvkCreateFence(g_dev, &fci, NULL, &fence);
     const uint64_t sC = vmtl_perf_now();
@@ -5078,7 +5708,7 @@ int vmtl_vk_submit_begin_at(nvk_cmdbuf *c, vmtl_inflight *f, const char *who)
     result = g_state == 1 ? pvkQueueSubmit(g_queue, 1, &si, fence) : VK_ERROR_DEVICE_LOST;
     pthread_mutex_unlock(&vmtl_submit_mutex);
     pt[4] = vmtl_perf_now();
-    g_cmd_submitted++;
+    c->grace_seq = ++g_cmd_submitted;
     if (result != VK_SUCCESS) {
         g_state = -1;
         nvlog("vk: queue submit -> %d; disabling backend and retaining uncertain in-flight resources", result);
@@ -5112,6 +5742,12 @@ int vmtl_vk_submit_finish(vmtl_inflight *f)
         g_state = -1;
         nvlog("vk: fence wait -> %d after %ld ms (budget %ld ms); disabling backend without retiring in-flight resources", wr, waited_ms, budget_ms);
         return -2;
+    }
+    if (c->grace_seq) {
+        pthread_mutex_lock(&g_grace_lock);
+        if (c->grace_seq > g_cmd_finished_seq) g_cmd_finished_seq = c->grace_seq;
+        pthread_mutex_unlock(&g_grace_lock);
+        vmtl_image_grace_reap();
     }
     if (c->wseq && c->wseq != VMTL_WSEQ_BLIND) {
         if (vmtl_keep_verdict(c->wseq) < 0) {
@@ -5213,6 +5849,16 @@ void vmtl_vk_image_destroy(nvk_image *i)
 {
     if (g_state != 1 || !i || !i->img) return;
     g_img_gone++;
+    if (vmtl_image_grace_held(i, NULL)) return;
+    vmtl_vk_image_destroy_now(i);
+}
+static void vmtl_vk_image_destroy_now(nvk_image *i)
+{
+    if (!i->img) {
+        if (i->view) pvkDestroyImageView(g_dev, (VkImageView)i->view, NULL);
+        i->view = NULL;
+        return;
+    }
     if (i->view) pvkDestroyImageView(g_dev, (VkImageView)i->view, NULL);
     pvkDestroyImage(g_dev, (VkImage)i->img, NULL);
     if (!i->placed && i->mem) { pvkFreeMemory(g_dev, (VkDeviceMemory)i->mem, NULL); g_alloc_bytes -= i->alloc; if (i->sysmem) { g_sys_bytes -= i->alloc; g_sys_align -= (i->alloc + 65535ull) & ~65535ull; } else { g_vram_bytes -= i->alloc; g_img_align -= (i->alloc + 65535ull) & ~65535ull; }    }
@@ -5254,7 +5900,7 @@ int vmtl_vk_image_reback(nvk_image *i, int to_sysmem, int a8)
     VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img, viewType,
         (VkFormat)i->fmt, swz, { VK_IMAGE_ASPECT_COLOR_BIT, 0, i->mips ? i->mips : 1, 0, t == 7 ? 1 : i->layers } };
     if (pvkCreateImageView(g_dev, &vci, NULL, &view) != VK_SUCCESS) { pvkFreeMemory(g_dev, mem, NULL); pvkDestroyImage(g_dev, img, NULL); return -1; }
-    if (i->view) pvkDestroyImageView(g_dev, (VkImageView)i->view, NULL);
+    if (i->view) vmtl_vk_image_view_destroy(i->view);
     pvkDestroyImage(g_dev, (VkImage)i->img, NULL);
     if (i->mem) { pvkFreeMemory(g_dev, (VkDeviceMemory)i->mem, NULL); g_alloc_bytes -= i->alloc; if (i->sysmem) { g_sys_bytes -= i->alloc; g_sys_align -= (i->alloc + 65535ull) & ~65535ull; } else { g_vram_bytes -= i->alloc; g_img_align -= (i->alloc + 65535ull) & ~65535ull; }    }
     uint64_t aligned = (mr.size + 65535ull) & ~65535ull;
@@ -5422,6 +6068,17 @@ void vmtl_vk_queue_destroy(nvk_queue *q)
 
 size_t vmtl_vk_allocated_bytes(void) { return g_alloc_bytes; }
 
+/* VMTL_SURFIN_ORDERED (on by default, =0 off): order the surface-in copy after earlier GPU reads.
+   A top-of-pipe barrier with no source access lets an upload overwrite the image while an earlier
+   composite is still sampling it (write-after-read). */
+static int vmtl_surfin_ordered_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("VMTL_SURFIN_ORDERED"); on = !(e && e[0] == '0');
+        nvlog("ordered surface-in %s (VMTL_SURFIN_ORDERED=%s)", on ? "on" : "off", e ? e : "unset"); }
+    return on;
+}
+
 int vmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t row_bytes)
 {
     const size_t bpp = img->bpp ? img->bpp : 4;
@@ -5434,10 +6091,12 @@ int vmtl_vk_image_write(nvk_queue *q, nvk_image *img, const void *src, size_t ro
         memcpy(dst + (size_t)y * cols * bpp, (const uint8_t *)src + (size_t)y * row_bytes, (size_t)cols * bpp);
     nvk_cmdbuf c; if (vmtl_vk_cmd_begin(q, &c)) return -1;
     VkImageSubresourceRange range = { vmtl_barrier_aspect(img), 0, 1, 0, 1 };
-    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+    VkImageMemoryBarrier toDst = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
+        vmtl_surfin_ordered_on() ? (VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT) : 0, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, (VkImage)img->img, range };
-    pvkCmdPipelineBarrier(c.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
+    pvkCmdPipelineBarrier(c.cb, vmtl_surfin_ordered_on() ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toDst);
     VkBufferImageCopy bic = { 0, 0, 0, { vmtl_copy_aspect(img), 0, 0, 1 }, { 0, 0, 0 }, { img->w, img->h, 1 } };
     pvkCmdCopyBufferToImage(c.cb, (VkBuffer)stage.buf, (VkImage)img->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bic);
     VkImageMemoryBarrier toRead = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL,
@@ -5844,7 +6503,11 @@ int vmtl_vk_image_view_create_aspect(nvk_image *img, uint32_t vkfmt, uint32_t as
     *out_view = v;
     return 0;
 }
-void vmtl_vk_image_view_destroy(void *view) { if (view) pvkDestroyImageView(g_dev, (VkImageView)view, NULL); }
+void vmtl_vk_image_view_destroy(void *view)
+{
+    if (!view || g_state != 1 || vmtl_image_grace_held(NULL, view)) return;
+    pvkDestroyImageView(g_dev, (VkImageView)view, NULL);
+}
 int vmtl_vk_texel_on(void) { return g_mutable && pvkCreateBufferView != NULL; }
 int vmtl_vk_texel_view_create(nvk_buffer *b, size_t offset, size_t range, uint32_t vkfmt, int storage, void **alias, void **view, int *storage_ok)
 {
@@ -5919,6 +6582,9 @@ int vmtl_vk_bind_texture_view(nvk_cmdbuf *c, uint32_t set, uint32_t index, void 
     const int same = was && was->kind == VMTL_SLOT_TEX && was->h == view;
     int r = vmtl_bind_slot(c, set, VMTL_NBUF + index, VMTL_SLOT_TEX, view, 0);
     if (!r && !same && c->table && set < 2) { extern uint32_t vmtl_bl_slot(void *); ((vmtl_bindtable *)c->table)->s[set][VMTL_NBUF + index].size = view ? vmtl_bl_slot(view) : 0; }
+    if (set == VMTL_SET_FRAGMENT && index == c->icon_binding && view == c->icon_view && vmtl_icon_c_trace_diag())
+        vmtl_icon_log("ICONBIND slot %u cb %p binding %u view %p rc %d",
+                      c->icon_seq, c, index, view, r);
     return r;
 }
 int vmtl_vk_bind_storage_view(nvk_cmdbuf *c, uint32_t set, uint32_t index, void *view)

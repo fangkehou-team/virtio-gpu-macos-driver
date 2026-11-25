@@ -6,6 +6,7 @@ set -uo pipefail
 OUT=${1:?usage: virtio_build.sh <outdir>}
 SRC=$(cd "$(dirname "$0")/../kexts/VirtIOGPU" && pwd)
 RE=$(cd "$(dirname "$0")/../kexts/NVRM/accel" && pwd)   # reconstructed OGKM headers (re/, iofam/) for VIOAccelProbe
+AGDC=$(cd "$(dirname "$0")/../kexts/VirtIOAGDC" && pwd) # the AGDC answer (ships inside this bundle; see that dir's header)
 mkdir -p "$OUT/VirtIOGPU.kext/Contents/MacOS"
 SDK=$(xcrun --show-sdk-path); KHDR="$SDK/System/Library/Frameworks/Kernel.framework/Headers"
 CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" -I"$RE/re" -I"$RE/iofam"
@@ -18,8 +19,10 @@ xcrun clang++ "${CFLAGS[@]}" -c "$SRC/VIOAccelProbe.cpp" -o "$OUT/VIOAccelProbe.
   || { grep error "$OUT/probe.err" | head -20; exit 1; }
 xcrun clang++ "${CFLAGS[@]}" -DVIO_FWD -c "$SRC/VirtIOAccel.cpp" -o "$OUT/VirtIOAccel.o" 2>"$OUT/accel.err" \
   || { grep error "$OUT/accel.err" | head -20; exit 1; }
+xcrun clang++ "${CFLAGS[@]}" -I"$AGDC" -c "$AGDC/vio-agdc.cpp" -o "$OUT/vio-agdc.o" 2>"$OUT/agdc.err" \
+  || { grep error "$OUT/agdc.err" | head -20; exit 1; }
 xcrun clang++ -arch x86_64 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext \
-  "$OUT/VirtIOGPU.o" "$OUT/VIOAccelProbe.o" "$OUT/VirtIOAccel.o" -o "$OUT/VirtIOGPU.kext/Contents/MacOS/VirtIOGPU" 2>"$OUT/gpuld.err" \
+  "$OUT/VirtIOGPU.o" "$OUT/VIOAccelProbe.o" "$OUT/VirtIOAccel.o" "$OUT/vio-agdc.o" -o "$OUT/VirtIOGPU.kext/Contents/MacOS/VirtIOGPU" 2>"$OUT/gpuld.err" \
   || { head -30 "$OUT/gpuld.err"; exit 1; }
 cp "$SRC/Info.plist" "$OUT/VirtIOGPU.kext/Contents/Info.plist"
 echo "VirtIOGPU $(md5 -q "$OUT/VirtIOGPU.kext/Contents/MacOS/VirtIOGPU") $(stat -f %z "$OUT/VirtIOGPU.kext/Contents/MacOS/VirtIOGPU") B  ($(xcrun clang++ --version | head -1))"

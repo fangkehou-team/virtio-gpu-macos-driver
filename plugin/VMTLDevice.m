@@ -108,6 +108,49 @@ void nvlog(const char *fmt, ...) {
 #endif
 }
 
+void vmtl_icon_log(const char *fmt, ...) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static char buffered[1200][512];
+    static unsigned count, dropped;
+    static int mode = -1, dumped;
+    static uint64_t next_poll;
+    if (!fmt) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (now < next_poll) return;
+        next_poll = now + 250000000ull;
+    }
+    char b[512] = "";
+    if (fmt) { va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a); }
+    if (mode < 0) mode = access("/var/tmp/vmtl-icon-buffer", F_OK) == 0;
+    if (mode) {
+        pthread_mutex_lock(&lock);
+        if (!dumped && !access("/var/tmp/vmtl-icon-dump", F_OK)) {
+            FILE *f = fopen(vmtl_log_path(), "a");
+            if (f) {
+                for (unsigned i = 0; i < count; i++)
+                    fprintf(f, "pid %d VMTL: %s\n", getpid(), buffered[i]);
+                if (dropped) fprintf(f, "pid %d VMTL: ICONLOG dropped %u buffered records\n", getpid(), dropped);
+                fclose(f);
+                dumped = 1;
+            }
+        }
+        if (!dumped) {
+            if (fmt) {
+                if (count < sizeof buffered / sizeof buffered[0])
+                    snprintf(buffered[count++], sizeof buffered[0], "%s", b);
+                else dropped++;
+            }
+            pthread_mutex_unlock(&lock);
+            return;
+        }
+        pthread_mutex_unlock(&lock);
+    }
+    if (fmt) {
+        FILE *f = fopen(vmtl_log_path(), "a");
+        if (f) { fprintf(f, "pid %d VMTL: %s\n", getpid(), b); fclose(f); }
+    }
+}
+
 #define VMTL_OOM_STREAK      32
 #define VMTL_OOM_COOLDOWN_NS (250ull * 1000ull * 1000ull)
 static _Atomic uint64_t g_oom_streak, g_oom_until;
@@ -660,6 +703,9 @@ static BOOL vmtl_desc_fbo(MTLTextureDescriptor *d) {
     t->_usage = d.usage;
     if (wantStex && !t->_stex) { static unsigned long lost; lost++;
         if (!(lost & (lost - 1))) nvlog("newTextureWithDescriptor: pixel format %lu asked for ShaderWrite and NVK cannot make it a storage image — shader writes to it will be LOST (%lu texture(s) so far in this process)", (unsigned long)d.pixelFormat, lost); }
+    if (d.width == 128 && d.height == 128 && bpp == 4 && !access("/var/tmp/vmtl-icon-trace", F_OK))
+        vmtl_icon_log("ICONCREATE ordinary tex %p img %p q %p fmt %lu usage %#x",
+              (__bridge void *)t, &t->_i, t->_q, (unsigned long)d.pixelFormat, t->_i.usage);
     nvlog("newTextureWithDescriptor: %lux%lu%s -> %p", (unsigned long)d.width, (unsigned long)d.height, t->_stex ? " +storage" : "", (__bridge void *)t); return t; }
 
 typedef struct { uint32_t magic, seed, gen; } vmtl_vram_tag;
@@ -747,6 +793,46 @@ static int vmtl_surface_image_create(VMTLTexture *t, IOSurfaceRef surf, NSUInteg
     t->_usage = d.usage;
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
+    return t; }
+
+/* CoreDisplay's other CreateMTLTexture entry (DisplaySurface.mm:230): a display
+   surface backed by an IOAccelerator surface instead of an IOSurfaceRef arrives
+   as [device newTextureWithSurface:surfaceID buffer:bufferIndex].  The
+   accelerator's surfaces are created from IOSurfaces and keep the IOSurface ID,
+   so the wrap reduces to the IOSurface path above.  A miss is not fatal here --
+   CoreDisplay only logs it and repaints -- but log it ourselves so a real ID
+   mismatch is visible rather than a silent black screen. */
+- (id<MTLTexture>)newTextureWithSurface:(unsigned int)surfaceID buffer:(NSUInteger)buffer {
+    if (vmtl_vk_init()) return nil;
+    IOSurfaceRef surf = IOSurfaceLookup((IOSurfaceID)surfaceID);
+    if (!surf) {
+        static unsigned n; if (n++ < 8)
+            nvlog("newTextureWithSurface:%u buffer:%lu -> no IOSurface with that ID (nil)",
+                  surfaceID, (unsigned long)buffer);
+        return nil; }
+    size_t w = IOSurfaceGetWidth(surf), h = IOSurfaceGetHeight(surf);
+    MTLPixelFormat fmt = MTLPixelFormatInvalid;
+    switch (IOSurfaceGetPixelFormat(surf)) {
+    case 'BGRA':                    fmt = MTLPixelFormatBGRA8Unorm; break;
+    case 'RGBA':                    fmt = MTLPixelFormatRGBA8Unorm; break;
+    case 'l10r':                    fmt = MTLPixelFormatBGR10A2Unorm; break;
+    default: break;
+    }
+    if (fmt == MTLPixelFormatInvalid || !w || !h) {
+        nvlog("newTextureWithSurface:%u buffer:%lu -> %zux%zu pixel format 0x%08x not carried (nil)",
+              surfaceID, (unsigned long)buffer, w, h, (unsigned)IOSurfaceGetPixelFormat(surf));
+        CFRelease(surf); return nil; }
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                                                 width:w height:h mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    id<MTLTexture> t = [self newTextureWithDescriptor:d iosurface:surf plane:0];
+    if (buffer && t) {
+        static int said; if (!said++)
+            nvlog("newTextureWithSurface: buffer index %lu is not 0 - the single IOSurface backing is used",
+                  (unsigned long)buffer); }
+    nvlog("newTextureWithSurface:%u buffer:%lu -> %p (%zux%zu fmt %lu)",
+          surfaceID, (unsigned long)buffer, (__bridge void *)t, w, h, (unsigned long)fmt);
+    CFRelease(surf);
     return t; }
 
 - (id<MTLLibrary>)vmtlNewLibraryWithSPIRV:(NSDictionary<NSString *, NSData *> *)fns {
@@ -1704,6 +1790,14 @@ static void vmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 }
 - (BOOL)hasUnifiedMemory { return NO; }
 - (uint64_t)dedicatedMemorySize { return vmtl_vk_vram_bytes(); }
+
+/* CoreDisplay::MetalDevice::CreateMTLTexture (DisplaySurface.mm:210) treats a
+   failed surface->MTLTexture wrap as fatal unless the device answers YES here:
+   `if (![mtlDevice isRemovable]) abort();`.  A paravirtual GPU has no fixed
+   display to lose, so answering YES both matches the hardware and turns a
+   transient wrap failure into CoreDisplay's logged retry instead of a
+   WindowServer SIGABRT. */
+- (BOOL)isRemovable { return YES; }
 
 - (BOOL)vmtlSampleCountOK:(NSUInteger)n {
     if (n == 0 || (n & (n - 1)) != 0 || n > 64) return NO;

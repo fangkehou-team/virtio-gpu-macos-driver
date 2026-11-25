@@ -11,7 +11,7 @@
  * Skeleton stage: device bring-up, queue negotiation and the uapi surface
  * exist; command submission (P1) fills sGoCtl/sGoQ and the hostmem BAR.
  *
- * P1 display: VirtIOFB (IOFramebuffer subclass, same bundle) attaches on top
+ * P1 display: VirtIOAppleParavirtFB (IOFramebuffer subclass, same bundle) attaches on top
  * of the VirtIOGPU service and publishes the scanout backing store as the
  * aperture; a 60 Hz vblank timer pushes changed frames to the host with
  * TRANSFER_TO_HOST_2D + RESOURCE_FLUSH.
@@ -31,6 +31,8 @@
 #include <kern/locks.h>
 #include <mach/mach_time.h>
 #include <mach/mach_types.h>   /* kernel_task */
+#include <libkern/OSAtomic.h>
+#include <sys/sysctl.h>
 
 /* P4: IOSurface kext C++ symbols, exported by com.apple.iokit.IOSurface
    (link trick borrowed from kexts/NVRM/accel/nvrm-accel.cpp:1116 — declare
@@ -53,7 +55,42 @@ __private_extern__ kmod_stop_func_t  *_antimain = NULL;
 __private_extern__ int _kext_apple_cc = __APPLE_CC__;
 }
 
+/* defined in kexts/VirtIOAGDC/vio-agdc.cpp, linked into this same binary */
+extern "C" void vioAgdcInstall(void);
+/* defined in VirtIOAccel.cpp: nonzero while the scanout probe (debug.vioscanout)
+   is armed. Gates this framebuffer's accelerator-backed display mode. */
+extern "C" int vioAccelScanoutProbe(void);
+/* True only after IOP has successfully presented a complete scanout frame. */
+extern "C" int vioAccelScanoutOwned(void);
+
+/* The live VirtIOAppleParavirtFB service, so VirtIOAccel.cpp can publish properties on the
+   framebuffer under debug.vioaccltypes (see vioAccelPublishAccelReference).
+   Set in VirtIOAppleParavirtFB::start(), cleared in VirtIOAppleParavirtFB::stop(). */
+static IOService *gVioFBService = nullptr;
+extern "C" IOService *vioFramebufferService(void) { return gVioFBService; }
+
 #define LOG(fmt, ...) do { kprintf("VirtIOGPU: " fmt "\n", ##__VA_ARGS__); IOLog("VirtIOGPU: " fmt "\n", ##__VA_ARGS__); } while (0)
+
+static SInt64 gVioVblTicks = 0, gVioVblUploads = 0;
+static SInt64 gVioVblSuppressed = 0, gVioVblFlushFail = 0;
+SYSCTL_QUAD(_debug, OID_AUTO, viovbl_ticks, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gVioVblTicks, "framebuffer vblank callbacks");
+SYSCTL_QUAD(_debug, OID_AUTO, viovbl_uploads, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gVioVblUploads, "successful legacy vblank scanout uploads");
+SYSCTL_QUAD(_debug, OID_AUTO, viovbl_suppressed, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gVioVblSuppressed, "vblank uploads suppressed because IOP owns the scanout");
+SYSCTL_QUAD(_debug, OID_AUTO, viovbl_flush_fail, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gVioVblFlushFail, "legacy vblank scanout upload failures");
+static SInt64 gVioCtrlCmds = 0, gVioCtrlSleeps = 0, gVioCtrlTimeouts = 0;
+static SInt64 gVioCtrlBusyWaits = 0;
+SYSCTL_QUAD(_debug, OID_AUTO, vioctrl_cmds, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gVioCtrlCmds, "synchronous virtio-gpu control commands");
+SYSCTL_QUAD(_debug, OID_AUTO, vioctrl_sleeps, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gVioCtrlSleeps, "one-millisecond sleeps while waiting for control commands");
+SYSCTL_QUAD(_debug, OID_AUTO, vioctrl_timeouts, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gVioCtrlTimeouts, "virtio-gpu control command timeouts");
+SYSCTL_QUAD(_debug, OID_AUTO, vioctrl_busy_waits, CTLFLAG_RD | CTLFLAG_LOCKED,
+            &gVioCtrlBusyWaits, "ten-microsecond bounded polls before sleeping for control commands");
 
 /* ---- virtio PCI layout ----
    Transitional devices expose a legacy I/O BAR0 with fixed offsets; modern
@@ -545,11 +582,26 @@ struct vq {
     void      *cookie[VQ_RING_SIZE];
 };
 
-/* two IOKit personalities in one bundle:
+/* three controller/accelerator personalities plus the PCI framebuffer claim:
    - VirtIOGPU claims the PCI device (probe score 20000 in the plist)
-   - VirtIOFB attaches on the VirtIOGPU service; IOMatchCategory IOFramebuffer
-     makes it the one framebuffer candidate on this controller, and a score
-     above IONDRVFramebuffer's keeps it in front of the firmware console. */
+   - VIOFBClaim holds the PCI nub's IOFramebuffer category against IONDRVFramebuffer
+   - VirtIOAppleParavirtFB attaches on the VirtIOGPU service in its own, separate
+     IOFramebuffer category and supplies the accelerator's sole display pipe. */
+/* Occupy IOFramebuffer on the PCI nub so Apple's generic IONDRVFramebuffer
+   cannot become the accelerator's first (and, at maxFB=1, only) display pipe.
+   The real VirtIOAppleParavirtFB lives one level down on VirtIOGPU. */
+class VIOFBClaim : public IOService {
+    OSDeclareDefaultStructors(VIOFBClaim)
+public:
+    bool start(IOService *provider) override {
+        if (!IOService::start(provider)) return false;
+        LOG("VIOFBClaim holds IOFramebuffer on %s; IONDRVFramebuffer blocked",
+            provider ? provider->getName() : "?");
+        return true;
+    }
+};
+OSDefineMetaClassAndStructors(VIOFBClaim, IOService)
+
 class VirtIOGPU;
 class IOAccelVirtIOGPUUserClient;
 
@@ -575,7 +627,7 @@ public:
     /* P2: memory for a mapped blob (type = bo handle) via clientMemoryForType */
     IOMemoryDescriptor *uapiMemoryForType(uint32_t type);
 
-    /* ---- surface VirtIOFB (IOFramebuffer) sits on ---- */
+    /* ---- surface VirtIOAppleParavirtFB (IOFramebuffer) sits on ---- */
     /* initial state was proven with the checkerboard; now it is the
        framebuffer backing store itself (zeroed black) */
     uint32_t scanoutWidth()  const { return fScanoutW; }
@@ -723,6 +775,42 @@ private:
 #define super IOService
 OSDefineMetaClassAndStructors(VirtIOGPU, IOService)
 
+/* --- probe hook (see VirtIOAccel.cpp) ---------------------------------------
+   The accelerator personality lives in the same kext, so one global is enough
+   to let its display pipe wrap this scanout in a VidMemory. Set in start()
+   once bringUpScanout() has run; the accessors return 0 until then, which is
+   the "no scanout yet" answer the pipe already handles. */
+static VirtIOGPU *gVioGPUInst = nullptr;
+extern "C" IOPhysicalAddress vioGPU_scanoutPhys(void)
+{
+    return gVioGPUInst ? gVioGPUInst->scanoutPhys() : 0;
+}
+extern "C" IOByteCount vioGPU_scanoutBytes(void)
+{
+    return (gVioGPUInst && gVioGPUInst->scanoutPhys())
+        ? (IOByteCount)gVioGPUInst->scanoutRowBytes() * gVioGPUInst->scanoutHeight() : 0;
+}
+extern "C" uint32_t vioGPU_scanoutPitch(void)
+{
+    return gVioGPUInst ? gVioGPUInst->scanoutRowBytes() : 0;
+}
+/* P4.3: the display pipe's present path copies the compositor's surface into
+   the scanout by CPU (the virtio 2D resource's linear backing store is writable
+   by the CPU alone), then pushes it to the host with the same T2D+FLUSH the
+   vblank timer uses. These hand it the destination and the push. */
+extern "C" void *vioGPU_scanoutKva(void)
+{
+    return gVioGPUInst ? gVioGPUInst->scanoutKva() : nullptr;
+}
+extern "C" uint32_t vioGPU_scanoutHeight(void)
+{
+    return gVioGPUInst ? gVioGPUInst->scanoutHeight() : 0;
+}
+extern "C" bool vioGPU_flushFrame(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    return gVioGPUInst ? gVioGPUInst->flushFrame(x, y, w, h) : false;
+}
+
 IOService *VirtIOGPU::probe(IOService *provider, SInt32 *score)
 {
     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
@@ -796,21 +884,38 @@ bool VirtIOGPU::start(IOService *provider)
         probeCapsets();
         bringUpScanout();
         uapiInit();
-        /* publish after the scanout is up so the VirtIOFB nub (matching on
+        /* publish after the scanout is up so the VirtIOAppleParavirtFB nub (matching on
            this service) starts against a live backing store. Required for
            the /Library/Extensions runtime-load path: kextd loads us long
            after the PCI bus is done matching, so without registerService()
            the fb personality never gets a second chance to attach. */
+        gVioGPUInst = this;   /* the accel's display pipe can now see the scanout */
         registerService();
     } else {
         probeDisplay();
         probeCapsets();
     }
+    sysctl_register_oid(&sysctl__debug_viovbl_ticks);
+    sysctl_register_oid(&sysctl__debug_viovbl_uploads);
+    sysctl_register_oid(&sysctl__debug_viovbl_suppressed);
+    sysctl_register_oid(&sysctl__debug_viovbl_flush_fail);
+    sysctl_register_oid(&sysctl__debug_vioctrl_cmds);
+    sysctl_register_oid(&sysctl__debug_vioctrl_sleeps);
+    sysctl_register_oid(&sysctl__debug_vioctrl_timeouts);
+    sysctl_register_oid(&sysctl__debug_vioctrl_busy_waits);
     return true;
 }
 
 void VirtIOGPU::stop(IOService *provider)
 {
+    sysctl_unregister_oid(&sysctl__debug_viovbl_ticks);
+    sysctl_unregister_oid(&sysctl__debug_viovbl_uploads);
+    sysctl_unregister_oid(&sysctl__debug_viovbl_suppressed);
+    sysctl_unregister_oid(&sysctl__debug_viovbl_flush_fail);
+    sysctl_unregister_oid(&sysctl__debug_vioctrl_cmds);
+    sysctl_unregister_oid(&sysctl__debug_vioctrl_sleeps);
+    sysctl_unregister_oid(&sysctl__debug_vioctrl_timeouts);
+    sysctl_unregister_oid(&sysctl__debug_vioctrl_busy_waits);
     if (fIntSrc) { fIntSrc->disable(); fWorkLoop->removeEventSource(fIntSrc); fIntSrc->release(); fIntSrc = nullptr; }
     uapiCleanup();
     if (fFbMem) { fFbMem->complete(); fFbMem->release(); fFbMem = nullptr; }
@@ -1122,6 +1227,7 @@ bool VirtIOGPU::ctrlCmdData(const void *req, uint32_t reqLen,
     vq *q = &fVq[0];
     if (!fCtrlBuf || reqLen > 2048 || respLen > 6144) return false;
     if (dataLen > kDataBufLen) { LOG("cmd data too big: %u", dataLen); return false; }
+    OSAddAtomic64(1, &gVioCtrlCmds);
 
     int count = dataLen ? 3 : 2;
     uint16_t head;
@@ -1158,20 +1264,38 @@ bool VirtIOGPU::ctrlCmdData(const void *req, uint32_t reqLen,
     if (!submit(q, head)) return false;
     uint16_t seq = q->availIdx;   /* device's used.idx reaches this when our chain completes */
 
+    /* Most Venus protocol commands complete in microseconds. Give them a
+       bounded 100 us fast path instead of rounding every one up to a 1 ms
+       scheduler sleep; retain the original slow-command timeout and sleep. */
     bool done = false;
+    for (int spin = 0; spin < 10 && !done; spin++) {
+        reap(q);
+        done = (q->lastUsed == seq);
+        if (!done) {
+            OSAddAtomic64(1, &gVioCtrlBusyWaits);
+            IODelay(10);
+        }
+    }
     for (int spin = 0; spin < 5000 && !done; spin++) {
         reap(q);
         done = (q->lastUsed == seq);
-        if (!done) IOSleep(1);
+        if (!done) {
+            OSAddAtomic64(1, &gVioCtrlSleeps);
+            IOSleep(1);
+        }
     }
-    if (!done) { LOG("ctrlCmdData: timeout (type %#x)", ((struct virtio_gpu_ctrl_hdr *)req)->type); return false; }
+    if (!done) {
+        OSAddAtomic64(1, &gVioCtrlTimeouts);
+        LOG("ctrlCmdData: timeout (type %#x)", ((struct virtio_gpu_ctrl_hdr *)req)->type);
+        return false;
+    }
     bcopy(fCtrlV + 2048, resp, respLen);
     return true;
 }
 
 /* allocate the framebuffer backing store and light up scanout 0 with it.
    The 64px checkerboard proved the path end to end; now the buffer is the
-   real aperture (black) that VirtIOFB publishes and WindowServer draws in. */
+   real aperture (black) that VirtIOAppleParavirtFB publishes and WindowServer draws in. */
 bool VirtIOGPU::bringUpScanout()
 {
     const uint32_t w = fScanoutW, h = fScanoutH;
@@ -1693,13 +1817,32 @@ IOReturn VirtIOGPU::uapiBlobCreateLocked(struct drm_virtgpu_resource_create_blob
         ent.addr = bo->guestPa;
         ent.length = (uint32_t)boSize;
         struct virtio_gpu_ctrl_hdr resp = {};
-        if (!ctrlCmdData(&cb, sizeof(cb), &ent, sizeof(ent), &resp, sizeof(resp)) ||
-            resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
-            LOG("CREATE_BLOB res %u: resp %#x", resId, resp.type);
+        bool created = false;
+        uint32_t retries = 0;
+        for (uint32_t attempt = 0; attempt < 100; attempt++) {
+            resp = {};
+            if (!ctrlCmdData(&cb, sizeof(cb), &ent, sizeof(ent), &resp, sizeof(resp)))
+                break;
+            if (resp.type == VIRTIO_GPU_RESP_OK_NODATA) {
+                created = true;
+                break;
+            }
+            if (resp.type != VIRTIO_GPU_RESP_ERR_UNSPEC)
+                break;
+            /* Venus learns vkAllocateMemory through the asynchronous 3D ring.
+               A following CREATE_BLOB control request can arrive first and be
+               rejected before any host resource exists.  Retry only that case;
+               the successful create is idempotent because the loop stops. */
+            retries++;
+            if (attempt + 1 < 100) IOSleep(1);
+        }
+        if (!created) {
+            LOG("CREATE_BLOB res %u: resp %#x after %u retries", resId, resp.type, retries);
             bo->guestMem->complete(); bo->guestMem->release();
             *bo = {}; fNextResId--;
             return kIOReturnIOError;
         }
+        if (retries) LOG("CREATE_BLOB res %u: succeeded after %u retries", resId, retries);
         bo->attached = true;   /* created with ctx_id: auto-attached host-side */
     } else {
         /* HOST3D: CREATE_BLOB with no entries */
@@ -2219,11 +2362,13 @@ IOReturn IOAccelVirtIOGPUUserClient::sWaitEvent(OSObject *target, void *referenc
 }
 
 /* ======================================================================
- * VirtIOFB — the IOFramebuffer that makes this the console display.
+ * VirtIOAppleParavirtFB — the IOFramebuffer that makes this the console display.
  *
  * Attaches on the VirtIOGPU service (same bundle, nub personality with
- * IOMatchCategory IOFramebuffer so IONDRVFramebuffer cannot also take it).
- * The aperture is the VirtIOGPU scanout backing store; WindowServer writes
+ * IOMatchCategory IOFramebuffer). VIOFBClaim separately occupies that category
+ * on the parent PCI nub, preventing a generic IONDRVFramebuffer from consuming
+ * the accelerator's only display pipe. The aperture is the VirtIOGPU scanout
+ * backing store; WindowServer writes
  * pixels there directly, and a 60 Hz timer pushes changed frames to the
  * host (T2D + FLUSH — see flushFrame). Mode list is the single 1280x800
  * mode the host surface has; display-mode negotiation (EDID, resizing)
@@ -2235,8 +2380,8 @@ IOReturn IOAccelVirtIOGPUUserClient::sWaitEvent(OSObject *target, void *referenc
  * acknowledges the first WindowServer restart freezes the machine.
  * ====================================================================== */
 
-class VirtIOFB : public IOFramebuffer {
-    OSDeclareDefaultStructors(VirtIOFB)
+class VirtIOAppleParavirtFB : public IOFramebuffer {
+    OSDeclareDefaultStructors(VirtIOAppleParavirtFB)
 public:
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
@@ -2297,7 +2442,15 @@ public:
         }
     }
     IOReturn connectFlags(IOIndex, IODisplayModeID, IOOptionBits *flags) override {
-        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+        if (flags) {
+            *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+            /* FALSIFIED as the compositor gate (measured): with this flag set
+               from boot, WindowServer still runs CDDisplay::render_update ->
+               CompositorSW::CompositeLayersToDestination. Kept gated because
+               it is the truthful declaration once the display pipe really
+               backs the mode, and it costs nothing. */
+            if (vioAccelScanoutProbe()) *flags |= kDisplayModeAcceleratorBackedFlag;
+        }
         return kIOReturnSuccess;
     }
     IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
@@ -2332,15 +2485,19 @@ private:
     volatile bool fStopping = false;
     uint64_t fFrameNs = 16666667ull;   /* 60 Hz period */
     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
-        VirtIOFB *me = (VirtIOFB *)p0;
+        VirtIOAppleParavirtFB *me = (VirtIOAppleParavirtFB *)p0;
         if (me->fStopping) return;
-        /* push the framebuffer to the host every vsync: QEMU's 2D path draws
-           the scanout from its own pixman image, fed only by
-           TRANSFER_TO_HOST_2D (full frame — partial rects re-tile rows), then
-           RESOURCE_FLUSH flips it to the display. WindowServer writes pixels
-           into the aperture between vblanks; this is the only thing that
-           makes its output visible. */
-        me->fDev->flushFrame(0, 0, me->fWidth, me->fHeight);
+        OSAddAtomic64(1, &gVioVblTicks);
+        /* Once IOP has presented a complete frame it owns subsequent host
+           updates. Keep the legacy upload for boot, non-IOP mode and every
+           ownership loss, but never suppress the vblank callback or rearm. */
+        if (vioAccelScanoutOwned()) {
+            OSAddAtomic64(1, &gVioVblSuppressed);
+        } else if (me->fDev->flushFrame(0, 0, me->fWidth, me->fHeight)) {
+            OSAddAtomic64(1, &gVioVblUploads);
+        } else {
+            OSAddAtomic64(1, &gVioVblFlushFail);
+        }
         if (me->fVbl.proc) me->fVbl.proc(me->fVbl.target, me->fVbl.ref);
         uint64_t period; nanoseconds_to_absolutetime(me->fFrameNs, &period);
         uint64_t now = mach_absolute_time();
@@ -2365,12 +2522,12 @@ static IOPMPowerState sPowerStates[2] = {
     { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     { kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
 };
-IOPMPowerState *VirtIOFB::powerStates() { return sPowerStates; }
+IOPMPowerState *VirtIOAppleParavirtFB::powerStates() { return sPowerStates; }
 
 #define super IOFramebuffer
-OSDefineMetaClassAndStructors(VirtIOFB, IOFramebuffer)
+OSDefineMetaClassAndStructors(VirtIOAppleParavirtFB, IOFramebuffer)
 
-bool VirtIOFB::start(IOService *provider)
+bool VirtIOAppleParavirtFB::start(IOService *provider)
 {
     fDev = OSDynamicCast(VirtIOGPU, provider);
     if (!fDev || !fDev->scanoutKva()) { LOG("fb: no VirtIOGPU scanout behind me"); return false; }
@@ -2397,12 +2554,24 @@ bool VirtIOFB::start(IOService *provider)
     armVbl();
     registerPowerDriver(this, powerStates(), 2);
     LOG("fb: published %ux%u B8G8R8A8 rowbytes %u", fWidth, fHeight, fRowBytes);
+
+    /* The AGDC answer for this GPU (kexts/VirtIOAGDC/vio-agdc.cpp). It is armed
+       from here rather than from a personality: an IOResources personality made
+       this bundle fail the aux-KC approval check at boot and the GPU lost its
+       driver. Enabled by debug.vioagdc=1 in boot-args or a later sysctl write,
+       so a bad bring-up is one reboot (or one sysctl) away from being undone. */
+    /* The boot-time AGDC worker discovers this object through
+       IOService::copyMatchingService(), so register it before entering the hook. */
+    gVioFBService = this;
+    registerService();
+    vioAgdcInstall();
     return true;
 }
 
-void VirtIOFB::stop(IOService *provider)
+void VirtIOAppleParavirtFB::stop(IOService *provider)
 {
     fStopping = true;
+    if (gVioFBService == this) gVioFBService = nullptr;
     /* thread_call_cancel_wait is not exported to kexts: cancel and retry the
        free until the callback is out (as NVRMFB/NMIntelFB) */
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
@@ -2410,24 +2579,29 @@ void VirtIOFB::stop(IOService *provider)
     IOFramebuffer::stop(provider);
 }
 
-IODeviceMemory *VirtIOFB::getApertureRange(IOPixelAperture aperture)
+IODeviceMemory *VirtIOAppleParavirtFB::getApertureRange(IOPixelAperture aperture)
 {
     if (aperture != kIOFBSystemAperture) return nullptr;
     if (fAperture) { fAperture->retain(); return fAperture; }
     return IODeviceMemory::withRange(fDev->scanoutPhys(), (IOPhysicalLength)fRowBytes * fHeight);
 }
 
-IOReturn VirtIOFB::getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info)
+IOReturn VirtIOAppleParavirtFB::getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info)
 {
     if (mode != 1 || !info) return kIOReturnBadArgument;
     bzero(info, sizeof(*info));
     info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
     info->refreshRate = 60 << 16;
     info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+    /* Declared accelerator backed once the scanout probe is armed. Measured
+       (2026-10-17, kDisplayModeAcceleratorBackedFlag = 0x400000 set from boot):
+       WindowServer sees flags 0x400007 and still composites the desktop with
+       CompositorSW, so this flag is NOT the compositor gate. */
+    if (vioAccelScanoutProbe()) info->flags |= kDisplayModeAcceleratorBackedFlag;
     return kIOReturnSuccess;
 }
 
-IOReturn VirtIOFB::getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi)
+IOReturn VirtIOAppleParavirtFB::getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi)
 {
     if (mode != 1 || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
     bzero(pi, sizeof(*pi));
@@ -2439,7 +2613,7 @@ IOReturn VirtIOFB::getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPi
     return kIOReturnSuccess;
 }
 
-IOReturn VirtIOFB::getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info)
+IOReturn VirtIOAppleParavirtFB::getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info)
 {
     if (mode != 1 || !info) return kIOReturnUnsupportedMode;
     bzero(info, sizeof(*info));

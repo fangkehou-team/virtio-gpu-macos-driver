@@ -11,7 +11,10 @@ enum { kIOAccelLegacyDisplayPipeSize = 0x380 };
 class IOAccelLegacyDisplayPipe : public IOAccelDisplayPipe {
     OSDeclareDefaultStructors(IOAccelLegacyDisplayPipe);
 public:
-    virtual bool initScanoutResource(unsigned int, IOAccelResource2*);
+    /* init_scanout_resource() treats the result as an IOAccelMemory: it sets
+       bit 0x20 in the object's flags, stores it at resource+0x88 and prepares
+       the resource. This is not the boolean the generated header inferred. */
+    virtual IOAccelMemory *initScanoutResource(unsigned int, IOAccelResource2*);
     virtual void destroyScanoutResource(unsigned int, IOAccelResource2*);
     virtual void setStereo(IOAccelStereoMode);
     virtual void needsSecondaryFramebufferResources();

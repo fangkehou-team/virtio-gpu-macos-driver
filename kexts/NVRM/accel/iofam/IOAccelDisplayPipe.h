@@ -24,7 +24,7 @@ public:
     virtual IOReturn validateTransaction(IOAccelDisplayPipeTransaction2*);
     virtual IOReturn performTransaction(IOAccelDisplayPipeTransaction2*);
     virtual bool isTransactionComplete(IOAccelDisplayPipeTransaction2*);
-    virtual void submitTransaction(IOAccelDisplayPipeTransaction2*);
+    virtual IOReturn submitTransaction(IOAccelDisplayPipeTransaction2*);
     virtual void getDisplayModePipeScalerSetup(IOAccelDisplayPipeScaler*);
     virtual OSObject * createWorkLoop();
     virtual void copyCapabilities();

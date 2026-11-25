@@ -146,6 +146,11 @@ public:
        accelerator hung here, in the kernel, for as long as this bit stayed clear. */
     void enableAccelerator();
     void disableAccelerator();
+    /* Non-virtual family helper. found_framebuffer() calls it once, but an
+       early sweep can precede IOFramebuffer::getVRAMRange() becoming ready;
+       a later explicit activation must retry it before display_mode_did_change
+       tests ivar 0x180. */
+    bool find_vram_descriptor();
     virtual void populateAccelConfig(IOAccelConfig*) = 0;   /* slot 312 — PURE VIRTUAL, WE MUST IMPLEMENT */
     virtual uint64_t calcMaxGPUPhysicalMemoryBytes(unsigned long long);   /* slot 313 */
     virtual bool configureDevice(IOPCIDevice*) = 0;   /* slot 314 — PURE VIRTUAL, WE MUST IMPLEMENT */

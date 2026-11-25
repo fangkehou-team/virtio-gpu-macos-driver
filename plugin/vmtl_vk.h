@@ -40,7 +40,7 @@ void vmtl_vk_pipeline_destroy(nvk_pipeline *p);
 typedef struct { void *pool; nvk_buffer stage; } nvk_queue;
 #include "vmtl_sampler_desc.h"
 typedef struct { void *s; int linear, repeat; float lod_min, lod_max; vmtl_sampler_desc desc; int full_state; } nvk_sampler;
-typedef struct { void *pool, *set; } nvk_setref;
+typedef struct { void *pool, *set, *b3; size_t b3off, b3range; uint32_t b3write, b3dummy; } nvk_setref;
 typedef struct {
     uint64_t gpu_tick, uptime_ns, uncertainty_ns;
     uint32_t valid_bits;
@@ -68,6 +68,8 @@ typedef struct { void *cb; void *fb; void *pool; void *dset[2]; void *depth_view
                  void *counter_recording; unsigned counter_error;
                  vmtl_sample_pattern sample_pattern;
                  void **rvs; unsigned nrv, caprv;
+                 uint64_t grace_seq;
+                 void *icon_view; uint32_t icon_binding, icon_seq, matrix_seq;
                } nvk_cmdbuf;
 int  vmtl_vk_init(void);
 int vmtl_vk_sample_positions_backend(void);
@@ -79,6 +81,7 @@ void vmtl_vk_limits(uint32_t *layers, uint32_t *shared_bytes, uint32_t wg[3], ui
 int vmtl_vk_tg_reject(const uint32_t l[3], const uint32_t *t, const char *kernel, uint32_t lin);
 void vmtl_vk_pubcaps(uint32_t *color_samples, uint32_t *depth_samples, uint64_t *max_storage_range, uint64_t *linear_align);
 int  vmtl_vk_buffer_create(size_t size, int host_visible, nvk_buffer *out);
+int  vmtl_vk_buffer_create_unpooled(size_t size, int host_visible, nvk_buffer *out);
 enum { NVP_BEGIN, NVP_BUFNEW, NVP_BUFPOOL, NVP_BUFDEL, NVP_HEAP, NVP_SYNCIN, NVP_SYNCOUT, NVP_COPY, NVP_N };
 uint64_t vmtl_perf_now(void);
 void vmtl_perf_note(int what, uint64_t t0, uint64_t bytes);
@@ -157,7 +160,11 @@ int  vmtl_vk_sampler_create(int linear, int repeat, nvk_sampler *out);
 int  vmtl_vk_sampler_create_desc(const vmtl_sampler_desc *desc, nvk_sampler *out);
 void vmtl_vk_sampler_destroy(nvk_sampler *s);
 int  vmtl_vk_bind_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s);
+int  vmtl_vk_trace_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, char *out, size_t cap);
+int  vmtl_vk_bind_parked_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s);
+void vmtl_vk_parked_samplers_keep(nvk_cmdbuf *c, uint32_t set, uint32_t keep);
 void vmtl_vk_cmd_bind_set(nvk_cmdbuf *c, nvk_pipeline *p);
+void vmtl_vk_diag_matrix_set(nvk_cmdbuf *c, void **set, nvk_setref *ref);
 int  vmtl_vk_compute_pipeline_create(const void *cs, size_t n, nvk_pipeline *out);
 void vmtl_vk_cmd_dispatch(nvk_cmdbuf *c, nvk_pipeline *p, uint32_t gx, uint32_t gy, uint32_t gz);
 void vmtl_vk_cmd_dispatch_threads(nvk_cmdbuf *c, nvk_pipeline *p, const uint32_t threads[3], const uint32_t tg[3]);

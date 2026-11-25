@@ -16,8 +16,10 @@ static inline NSMutableData *vmtl_fc_storage(NSUInteger count) {
     return [NSMutableData dataWithLength:count * stride];
 }
 @class VMTLHeap;
+@class VMTLCommandBuffer;
 @interface VMTLBuffer : NSObject <MTLBuffer> { @public nvk_buffer _b; MTLStorageMode _storage; VMTLHeap *_heap; NSUInteger _heapOffset;
     void *_hostPtr; size_t _hostLen; id _hostDealloc;
+    BOOL _hostSyncInOnly;
     VMTLHeap *_subHeap; NSUInteger _subCharge; BOOL _aliased;
     nvk_buffer _shadow; int _syncOut; int _zshadow;
     NSUInteger _dirtyLo, _dirtyHi; } @end
@@ -46,6 +48,7 @@ static inline void *vmtl_buf_cpu(VMTLBuffer *b) { vmtl_buf_settle(b); return b->
   uint32_t _surfSeed, _surfGen; BOOL _surfSynced, _surfOwned;
   nvk_buffer _vramBuf; BOOL _vramOn;
   BOOL _stex;
+  BOOL _tiledCopy, _tiledDirty;
   uint64_t _resid;
   NSUInteger _usage;
   VMTLBuffer *_backBuf; NSUInteger _backOff, _backBPR;
@@ -53,6 +56,7 @@ static inline void *vmtl_buf_cpu(VMTLBuffer *b) { vmtl_buf_settle(b); return b->
 - (nvk_image *)nvi;
 - (void *)nvview;
 - (void)vmtlSurfaceIn;
+- (void)vmtlSurfaceInCmd:(VMTLCommandBuffer *)cb;
 - (BOOL)vmtlSurfaceOut;
 @end
 @interface VMTLFunction : NSObject <MTLFunction> { @public NSData *_spirv; NSString *_fname; NSString *_stage; NSString *_air; NSDictionary *_fc; NSArray *_embedded; unsigned char _bcHash[32]; BOOL _bcHashed;
@@ -113,6 +117,8 @@ extern id gVMTLMainDevice;
   NSMutableArray *_handlers;
   NSMutableArray *_scratch;
   NSMutableSet *_resources;
+  NSMutableSet *_tiledSynced;
+  NSUInteger _tiledPart;
   NSMutableSet *_surfDirty;
   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
   unsigned _nEncSealed;
@@ -199,10 +205,15 @@ uint32_t vmtl_geoms_from_descriptor(id desc, vmtl_geom *out, uint32_t max, int *
   BOOL _visActive, _visPending;
   NSMutableArray *_visRecords;
   nvk_pass _pass; nvk_rtsig _passSig; BOOL _hasRef, _refused;
+  VMTLBuffer *_snapVB; NSUInteger _snapVBOff[8]; uint32_t _snapVBCount;
+  VMTLBuffer *_snapMB; NSUInteger _snapMBOff[16][2]; uint32_t _snapMBCount;
+  unsigned char _snapMBExpected[16][272];
+  VMTLTexture *_diagPlane0, *_diagPlane1;
 } @end
 @interface VMTLRenderCommandEncoder ()
 - (BOOL)vmtlBuildPass:(MTLRenderPassDescriptor *)d;
 - (BOOL)vmtlBeginPassLoad:(uint32_t)load;
+- (BOOL)vmtlEnsurePass:(VMTLRenderPipelineState *)p;
 - (void)vmtlApplyDepthStencil;
 @end
 

@@ -18,7 +18,7 @@ public:
     virtual void display_mode_will_change(unsigned int) APPLE_KEXT_OVERRIDE;
     virtual void display_mode_did_change(unsigned int) APPLE_KEXT_OVERRIDE;
     virtual void found_framebuffer(IOFramebuffer *) APPLE_KEXT_OVERRIDE;
-    virtual bool initScanoutResource(unsigned int, unsigned int, IOFramebuffer *, IOAccelResource2 *);
+    virtual IOAccelMemory *initScanoutResource(unsigned int, unsigned int, IOFramebuffer *, IOAccelResource2 *);
     virtual void destroyScanoutResource(unsigned int, unsigned int, IOFramebuffer *, IOAccelResource2 *);
     virtual void setStereo(unsigned int, IOAccelStereoMode);
     virtual void setupFullScreen(unsigned int, IOAccelResource2 *, IOAccelResource2 *);

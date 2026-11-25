@@ -1649,6 +1649,13 @@ id<MTLFunction> vmtl_link_stage(id<MTLFunction> kIn, MTLLinkedFunctions *lfIn, N
         fn = df;
     }
     if (!fn->_needsLink) return k;
+    /* A deferred function must carry its AIR: the translator reads the visible
+       references out of it. Without this, a NULL AIR made xlate_vrefs return -1
+       with no message and the caller reported an empty "(%s)". */
+    if (!fn->_air.length) {
+        if (err) *err = vmtl_link_err([NSString stringWithFormat:@"\"%@\": deferred to link but carries no AIR - the library index kept only the compiled blob", fn->_fname]);
+        return nil;
+    }
     if (!vmtl_xlate_ready() || !xlate_vrefs || !xlate_link) {
         if (err) *err = vmtl_link_err(@"this translator has no vmtl_link_visible - rebuild vmtl_translate-merge with patch_xl_link.py");
         return nil;

@@ -26,6 +26,8 @@
 		<!-- P4 STAGE_IMPORT: resolves the IOSurfaceRoot/IOSurface mangled
 		     symbols declared in VirtIOGPU.cpp -->
 		<key>com.apple.iokit.IOSurface</key><string>1.0</string>
+		<!-- the VIOAGDC* (AppleGraphicsDeviceControl) classes in vio-agdc.cpp -->
+		<key>com.apple.AppleGraphicsDeviceControl</key><string>1.0.0</string>
 	</dict>
 	<key>IOKitPersonalities</key>
 	<dict>
@@ -100,13 +102,29 @@
 			<key>IOMatchCategory</key><string>VIOAccelProbe</string>
 			<key>IOProbeScore</key><integer>10</integer>
 		</dict>
-		<key>VirtIOFB</key>
+		<!-- Hold the PCI nub's IOFramebuffer category before Apple's generic
+		     IONDRVFramebuffer (probe 20000) can claim it. The real framebuffer
+		     below attaches to VirtIOGPU, not to the PCI nub, so the two do not
+		     compete. Without this claim the accelerator creates its only pipe
+		     for IONDRVFramebuffer and rejects VirtIOAppleParavirtFB at maxFB=1. -->
+		<key>VIOFBClaim</key>
 		<dict>
 			<key>CFBundleIdentifier</key><string>io.vmtl.VirtIOGPU</string>
-			<key>IOClass</key><string>VirtIOFB</string>
+			<key>IOClass</key><string>VIOFBClaim</string>
+			<key>IOProviderClass</key><string>IOPCIDevice</string>
+			<key>IONameMatch</key><string>display</string>
+			<key>IOPCIPrimaryMatch</key><string>0x00001af4&amp;0x0000ffff</string>
+			<key>IOPCIClassMatch</key><string>0x03000000&amp;0xff000000</string>
+			<key>IOMatchCategory</key><string>IOFramebuffer</string>
+			<key>IOProbeScore</key><integer>60000</integer>
+		</dict>
+		<key>VirtIOAppleParavirtFB</key>
+		<dict>
+			<key>CFBundleIdentifier</key><string>io.vmtl.VirtIOGPU</string>
+			<key>IOClass</key><string>VirtIOAppleParavirtFB</string>
 			<key>IOProviderClass</key><string>VirtIOGPU</string>
-			<!-- one framebuffer candidate per controller: without this category the
-			     firmware IONDRVFramebuffer also matches and two consoles fight -->
+			<!-- This category applies to the VirtIOGPU child nub. VIOFBClaim
+			     separately keeps IONDRVFramebuffer off the parent PCI nub. -->
 			<key>IOMatchCategory</key><string>IOFramebuffer</string>
 			<key>IOProbeScore</key><integer>60000</integer>
 		</dict>
